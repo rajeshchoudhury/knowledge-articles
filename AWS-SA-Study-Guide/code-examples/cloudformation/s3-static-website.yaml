@@ -1,0 +1,427 @@
+################################################################################
+# AWS Solutions Architect - S3 Static Website with CloudFront
+################################################################################
+# KEY EXAM CONCEPTS:
+#   - S3 static website hosting: index document, error document, redirect rules
+#   - CloudFront OAC (Origin Access Control) replaces OAI — recommended approach
+#   - ACM certificates for CloudFront MUST be in us-east-1 (N. Virginia)
+#   - Route 53 alias records: no charge for queries, native AWS integration
+#   - CloudFront Functions: lightweight (JavaScript), viewer request/response only
+#   - Lambda@Edge: full Lambda, all 4 trigger points, up to 30s timeout
+#   - S3 bucket policy: only CloudFront can access the bucket directly
+################################################################################
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  S3 static website with CloudFront CDN, OAC, ACM certificate,
+  Route 53 DNS, and CloudFront Functions for URL rewriting.
+
+################################################################################
+# PARAMETERS
+################################################################################
+Parameters:
+  DomainName:
+    Description: Root domain name (e.g., example.com)
+    Type: String
+    AllowedPattern: '(?!-)[a-zA-Z0-9-.]{1,63}(?<!-)'
+
+  SubDomainName:
+    Description: Subdomain prefix (e.g., www). Leave empty for apex domain.
+    Type: String
+    Default: www
+
+  HostedZoneId:
+    Description: Route 53 Hosted Zone ID for the domain
+    Type: AWS::Route53::HostedZone::Id
+
+  PriceClass:
+    Description: CloudFront price class (determines edge location coverage)
+    Type: String
+    Default: PriceClass_100
+    AllowedValues:
+      # Exam tip: Price classes control which edge locations are used.
+      # PriceClass_100 = NA + Europe (cheapest)
+      # PriceClass_200 = PriceClass_100 + Asia/Middle East/Africa
+      # PriceClass_All = all edge locations (most expensive, lowest latency globally)
+      - PriceClass_100
+      - PriceClass_200
+      - PriceClass_All
+
+################################################################################
+# CONDITIONS
+################################################################################
+Conditions:
+  HasSubDomain: !Not [!Equals [!Ref SubDomainName, '']]
+
+################################################################################
+# RESOURCES
+################################################################################
+Resources:
+
+  ############################################################################
+  # S3 BUCKET
+  # Exam tip: When using CloudFront with OAC, the S3 bucket does NOT need
+  # static website hosting enabled. CloudFront accesses the bucket via the
+  # S3 REST API endpoint (not the website endpoint). This gives you:
+  #   - HTTPS support at the S3 level
+  #   - Private bucket access (no public access needed)
+  #   - Server-side encryption support
+  # However, for SPA routing (React/Angular), you need CloudFront error pages
+  # or CloudFront Functions to handle client-side routing.
+  ############################################################################
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !If
+        - HasSubDomain
+        - !Sub '${SubDomainName}.${DomainName}'
+        - !Ref DomainName
+      # Exam tip: Block ALL public access when using CloudFront OAC.
+      # Only CloudFront should access the bucket.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Exam tip: Versioning is recommended for production — enables rollback
+      # and protects against accidental deletion. Required for replication.
+      VersioningConfiguration:
+        Status: Enabled
+      # Exam tip: SSE-S3 (AES-256) is the default encryption. SSE-KMS gives
+      # you audit trail via CloudTrail and key rotation control. SSE-C means
+      # the customer manages the encryption key.
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # Lifecycle rules to manage old object versions and save costs.
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+            NoncurrentVersionTransitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 7
+      Tags:
+        - Key: Purpose
+          Value: static-website
+
+  # S3 bucket for CloudFront access logs
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub
+        - '${BucketName}-cf-logs'
+        - BucketName: !If
+            - HasSubDomain
+            - !Sub '${SubDomainName}.${DomainName}'
+            - !Ref DomainName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 60
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+
+  ############################################################################
+  # S3 BUCKET POLICY
+  # Exam tip: OAC uses a service principal condition to restrict access.
+  # The bucket policy allows CloudFront to perform s3:GetObject using a
+  # condition that validates the CloudFront distribution ID.
+  ############################################################################
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${WebsiteBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  ############################################################################
+  # ACM CERTIFICATE
+  # Exam tip: For CloudFront, certificates MUST be in us-east-1.
+  # ACM certificates are FREE for AWS services (ALB, CloudFront, API Gateway).
+  # DNS validation is preferred over email — auto-renews indefinitely.
+  # This template assumes the stack is deployed in us-east-1.
+  # For other regions, use a custom resource or separate stack.
+  ############################################################################
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !If
+        - HasSubDomain
+        - !Sub '${SubDomainName}.${DomainName}'
+        - !Ref DomainName
+      SubjectAlternativeNames:
+        - !If
+          - HasSubDomain
+          - !Ref DomainName
+          - !Sub 'www.${DomainName}'
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !If
+            - HasSubDomain
+            - !Sub '${SubDomainName}.${DomainName}'
+            - !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+      Tags:
+        - Key: Name
+          Value: !If
+            - HasSubDomain
+            - !Sub '${SubDomainName}.${DomainName}'
+            - !Ref DomainName
+
+  ############################################################################
+  # CLOUDFRONT FUNCTION — URL Rewriting
+  # Exam tip: CloudFront Functions vs Lambda@Edge:
+  #   CloudFront Functions:
+  #     - JavaScript only, max 10 KB code
+  #     - Viewer request/response ONLY
+  #     - Sub-millisecond execution, max 2 MB memory
+  #     - Millions of requests/second
+  #     - Use for: URL rewrites, header manipulation, cache key normalization
+  #   Lambda@Edge:
+  #     - Node.js or Python
+  #     - All 4 event types (viewer/origin request/response)
+  #     - Up to 30s timeout (origin events), 5s (viewer events)
+  #     - Up to 10,240 MB memory
+  #     - Use for: A/B testing, auth, dynamic content generation
+  ############################################################################
+  URLRewriteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${AWS::StackName}-url-rewrite'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Rewrite URLs for SPA routing — append index.html to directory paths
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var uri = request.uri;
+
+          // If URI ends with '/', append index.html
+          if (uri.endsWith('/')) {
+            request.uri += 'index.html';
+          }
+          // If URI doesn't have a file extension, assume SPA route
+          // and serve index.html (for React/Angular/Vue routing)
+          else if (!uri.includes('.')) {
+            request.uri = '/index.html';
+          }
+
+          return request;
+        }
+
+  ############################################################################
+  # CLOUDFRONT DISTRIBUTION
+  # Exam tip: CloudFront key concepts:
+  #   - Edge Locations: content is cached here (200+ locations globally)
+  #   - Regional Edge Caches: between origin and edge (larger cache)
+  #   - Origin: where content comes from (S3, ALB, EC2, custom HTTP)
+  #   - Behaviors: path patterns that define how requests are handled
+  #   - TTL: min/default/max controls how long objects are cached
+  #   - Invalidation: remove objects from cache (costs $$ for large invalidations)
+  #   - OAC (Origin Access Control): restricts S3 access to CloudFront only
+  #   - Signed URLs: time-limited access to individual files
+  #   - Signed Cookies: time-limited access to multiple files
+  ############################################################################
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn: WebsiteBucket
+    Properties:
+      DistributionConfig:
+        Comment: !Sub 'CDN for ${DomainName}'
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: !Ref PriceClass
+        DefaultRootObject: index.html
+
+        # Domain aliases
+        Aliases:
+          - !If
+            - HasSubDomain
+            - !Sub '${SubDomainName}.${DomainName}'
+            - !Ref DomainName
+
+        ViewerCertificate:
+          AcmCertificateArn: !Ref Certificate
+          SslSupportMethod: sni-only
+          # Exam tip: TLSv1.2_2021 is recommended minimum. SNI-only is free;
+          # dedicated IP costs $600/month per edge location.
+          MinimumProtocolVersion: TLSv1.2_2021
+
+        # Exam tip: Custom error responses allow SPA routing by returning
+        # index.html for 403/404 errors instead of showing an error page.
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+
+        # Origins define where CloudFront fetches content from
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt WebsiteBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            # OAC (Origin Access Control) — the modern way to restrict S3 access
+            OriginAccessControlId: !Ref CloudFrontOAC
+
+        # Default cache behavior
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true    # Automatic compression (gzip/brotli)
+          # Exam tip: Managed cache policies simplify configuration.
+          # CachingOptimized: recommended for S3 origins.
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6    # CachingOptimized
+          # Exam tip: Origin request policies control what's forwarded to origin.
+          # CORS-S3Origin: forwards CORS headers to S3.
+          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf    # CORS-S3Origin
+          # Associate the URL rewrite function with viewer requests
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt URLRewriteFunction.FunctionARN
+
+        # Exam tip: Access logging helps analyze traffic patterns, cache hit
+        # ratios, and identify issues. Logs are delivered to S3 with a delay.
+        Logging:
+          Bucket: !GetAtt LoggingBucket.RegionalDomainName
+          IncludeCookies: false
+          Prefix: cf-logs/
+
+        # Exam tip: Geo-restrictions block content from specific countries.
+        # Can be whitelist (only these countries) or blacklist (block these).
+        Restrictions:
+          GeoRestriction:
+            RestrictionType: none
+
+  ############################################################################
+  # CLOUDFRONT ORIGIN ACCESS CONTROL (OAC)
+  # Exam tip: OAC is the recommended replacement for OAI (Origin Access Identity).
+  # OAC supports: SSE-KMS encryption, dynamic requests (PUT/DELETE), and
+  # all S3 regions. OAI only supports SSE-S3 and GET requests.
+  ############################################################################
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-oac'
+        Description: OAC for S3 static website bucket
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  ############################################################################
+  # ROUTE 53 DNS RECORDS
+  # Exam tip: Alias records are AWS-specific and resolve to AWS resource IPs.
+  #   - No charge for alias queries to AWS resources
+  #   - Support zone apex (naked domain) — CNAME cannot do this
+  #   - Alias targets: CloudFront, ALB, S3 website, API Gateway, etc.
+  #   - Routing policies: Simple, Weighted, Latency, Failover, Geolocation,
+  #     Geoproximity, Multivalue, IP-based
+  ############################################################################
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !If
+        - HasSubDomain
+        - !Sub '${SubDomainName}.${DomainName}'
+        - !Ref DomainName
+      Type: A
+      AliasTarget:
+        # Exam tip: CloudFront's hosted zone ID is always Z2FDTNDATAQYW2.
+        # This is a well-known constant across all CloudFront distributions.
+        HostedZoneId: Z2FDTNDATAQYW2
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+
+  # IPv6 AAAA record
+  DNSRecordIPv6:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !If
+        - HasSubDomain
+        - !Sub '${SubDomainName}.${DomainName}'
+        - !Ref DomainName
+      Type: AAAA
+      AliasTarget:
+        HostedZoneId: Z2FDTNDATAQYW2
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+
+################################################################################
+# OUTPUTS
+################################################################################
+Outputs:
+  WebsiteURL:
+    Description: Website URL
+    Value: !If
+      - HasSubDomain
+      - !Sub 'https://${SubDomainName}.${DomainName}'
+      - !Sub 'https://${DomainName}'
+
+  CloudFrontDistributionId:
+    Description: CloudFront Distribution ID (for cache invalidation)
+    Value: !Ref CloudFrontDistribution
+
+  CloudFrontDomainName:
+    Description: CloudFront Distribution Domain Name
+    Value: !GetAtt CloudFrontDistribution.DomainName
+
+  S3BucketName:
+    Description: S3 Bucket Name (for deploying content)
+    Value: !Ref WebsiteBucket
+
+  S3BucketArn:
+    Description: S3 Bucket ARN
+    Value: !GetAtt WebsiteBucket.Arn
+
+  CertificateArn:
+    Description: ACM Certificate ARN
+    Value: !Ref Certificate
+
+  # Useful deployment command
+  DeployCommand:
+    Description: Command to deploy website content
+    Value: !Sub |
+      aws s3 sync ./build/ s3://${WebsiteBucket} --delete && \
+      aws cloudfront create-invalidation --distribution-id ${CloudFrontDistribution} --paths "/*"

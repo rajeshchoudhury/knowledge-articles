@@ -1,0 +1,494 @@
+################################################################################
+# AWS Solutions Architect - Serverless REST API (SAM/CloudFormation)
+################################################################################
+# KEY EXAM CONCEPTS:
+#   - SAM (Serverless Application Model) is a CloudFormation extension
+#   - API Gateway: REST API (regional/edge/private) vs HTTP API (simpler, cheaper)
+#   - Lambda: event-driven, 15-min max timeout, 10 GB max memory, /tmp = 10 GB
+#   - DynamoDB: key-value + document DB, single-digit ms latency
+#   - Cognito: user pools (authentication) vs identity pools (authorization/federation)
+#   - X-Ray: distributed tracing for debugging serverless architectures
+#   - Least privilege IAM: each function gets only the permissions it needs
+################################################################################
+
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless CRUD API with API Gateway, Lambda, DynamoDB, and Cognito auth.
+  Uses SAM transform for simplified serverless resource definitions.
+
+################################################################################
+# GLOBALS
+# Exam tip: SAM Globals set default properties for all functions/APIs.
+# Individual resources can override these defaults.
+################################################################################
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 256
+    Timeout: 30
+    # Exam tip: X-Ray tracing enables distributed tracing across
+    # API Gateway → Lambda → DynamoDB. Essential for debugging.
+    Tracing: Active
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref ItemsTable
+        POWERTOOLS_SERVICE_NAME: items-api
+        LOG_LEVEL: INFO
+
+  Api:
+    TracingEnabled: true
+    # Exam tip: API Gateway throttling protects backend services.
+    # Default limits: 10,000 requests/second, 5,000 burst.
+    # Per-method throttling allows fine-grained control.
+
+################################################################################
+# PARAMETERS
+################################################################################
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: production
+    AllowedValues:
+      - development
+      - staging
+      - production
+
+  StageName:
+    Type: String
+    Default: v1
+    Description: API Gateway deployment stage name
+
+################################################################################
+# RESOURCES
+################################################################################
+Resources:
+
+  ############################################################################
+  # COGNITO USER POOL
+  # Exam tip: User Pools handle AUTHENTICATION (sign-up, sign-in, MFA).
+  # Identity Pools handle AUTHORIZATION (map users to IAM roles for AWS access).
+  # User Pool tokens: ID token (identity claims), Access token (API permissions),
+  # Refresh token (get new ID/access tokens without re-authenticating).
+  ############################################################################
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${EnvironmentName}-items-api-users'
+      # Exam tip: Self-sign-up allows users to register without admin intervention.
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+      # Exam tip: Auto-verified attributes are automatically verified via email/SMS.
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      # Password policy defines minimum requirements.
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: name
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      # Exam tip: Account recovery defines how users reset passwords.
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+  # Exam tip: App clients define which apps can interact with the user pool.
+  # GenerateSecret: false for public clients (SPA, mobile), true for server-side apps.
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${EnvironmentName}-items-api-client'
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 1      # hours
+      IdTokenValidity: 1          # hours
+      RefreshTokenValidity: 30    # days
+
+  ############################################################################
+  # API GATEWAY REST API
+  # Exam tip: REST API types:
+  #   - Regional: API in current region (default, good for same-region clients)
+  #   - Edge-optimized: routed via CloudFront (better for geographically distributed)
+  #   - Private: accessible only from within a VPC via VPC endpoint
+  # API Gateway supports caching (0.5 GB to 237 GB) to reduce backend calls.
+  # Usage Plans + API Keys enable rate limiting and monetization.
+  ############################################################################
+  ItemsApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub '${EnvironmentName}-items-api'
+      StageName: !Ref StageName
+      Description: CRUD API for items with Cognito authorization
+      EndpointConfiguration:
+        Type: REGIONAL
+      # Cognito authorizer validates JWT tokens from the User Pool.
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+            Identity:
+              Header: Authorization
+      # Exam tip: CORS must be configured for browser-based clients.
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+      # Enable CloudWatch logging for API Gateway.
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: INFO
+          DataTraceEnabled: true
+          MetricsEnabled: true
+          ThrottlingRateLimit: 100
+          ThrottlingBurstLimit: 50
+
+  ############################################################################
+  # DYNAMODB TABLE
+  # Exam tip: DynamoDB key concepts:
+  #   - Partition key (PK): determines which partition stores the item
+  #   - Sort key (SK): allows range queries within a partition
+  #   - GSI: different PK/SK, eventually consistent, has own throughput
+  #   - LSI: same PK, different SK, must be created at table creation, strongly consistent
+  #   - Capacity modes: On-Demand (pay per request) vs Provisioned (cheaper, predictable)
+  #   - DAX: in-memory cache for DynamoDB (microsecond reads)
+  #   - Streams: capture item-level changes (useful for triggers, replication)
+  #   - TTL: automatically delete expired items (no cost for deletion)
+  ############################################################################
+  ItemsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain    # Prevent accidental data loss
+    Properties:
+      TableName: !Sub '${EnvironmentName}-items'
+      BillingMode: PAY_PER_REQUEST    # On-Demand mode
+      # Exam tip: On-Demand scales automatically, good for unpredictable workloads.
+      # Provisioned mode is cheaper for steady-state workloads — use Auto Scaling.
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH      # Partition key
+        - AttributeName: SK
+          KeyType: RANGE     # Sort key
+      # Exam tip: GSI allows querying by different attributes.
+      # GSI is eventually consistent only. GSI has its own throughput settings.
+      # You can add/remove GSIs after table creation (unlike LSIs).
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL    # ALL, KEYS_ONLY, or INCLUDE
+      # Exam tip: Point-in-time recovery allows restoring the table to any
+      # second within the last 35 days. Different from on-demand backups.
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      # Exam tip: SSE encrypts data at rest. Options:
+      #   - AWS owned key (default, free)
+      #   - AWS managed key (aws/dynamodb, free)
+      #   - Customer managed key (KMS, you control rotation/access)
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      # Exam tip: DynamoDB Streams capture changes in near real-time.
+      # Stream records contain: KEYS_ONLY, NEW_IMAGE, OLD_IMAGE, NEW_AND_OLD_IMAGES.
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      # TTL automatically deletes items after the specified timestamp.
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  ############################################################################
+  # LAMBDA FUNCTIONS
+  # Exam tip: Lambda limits (know these for the exam):
+  #   - Memory: 128 MB to 10,240 MB (CPU scales with memory)
+  #   - Timeout: max 15 minutes
+  #   - /tmp storage: 512 MB to 10,240 MB
+  #   - Deployment package: 50 MB zipped, 250 MB unzipped
+  #   - Concurrent executions: 1,000 default (can request increase)
+  #   - Environment variables: 4 KB max
+  #   - Layers: max 5 layers, 250 MB total unzipped
+  #   - Reserved concurrency: guarantees capacity for a function
+  #   - Provisioned concurrency: pre-initialized execution environments (no cold starts)
+  ############################################################################
+
+  # --- CREATE Item ---
+  CreateItemFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-create-item'
+      Handler: handlers/create_item.handler
+      Description: Create a new item in DynamoDB
+      # Exam tip: Each function gets its own IAM role with least privilege.
+      # SAM auto-creates the role when you specify Policies.
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ItemsTable
+      # Exam tip: Reserved concurrency limits how many concurrent executions
+      # this function can have. Protects downstream services from overload.
+      ReservedConcurrentExecutions: 50
+      Events:
+        CreateItem:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ItemsApi
+            Path: /items
+            Method: POST
+
+  # --- GET Item by ID ---
+  GetItemFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-get-item'
+      Handler: handlers/get_item.handler
+      Description: Get a single item from DynamoDB
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ItemsTable
+      Events:
+        GetItem:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ItemsApi
+            Path: /items/{id}
+            Method: GET
+
+  # --- LIST Items ---
+  ListItemsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-list-items'
+      Handler: handlers/list_items.handler
+      Description: List all items with optional filtering
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ItemsTable
+      Events:
+        ListItems:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ItemsApi
+            Path: /items
+            Method: GET
+
+  # --- UPDATE Item ---
+  UpdateItemFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-update-item'
+      Handler: handlers/update_item.handler
+      Description: Update an existing item in DynamoDB
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ItemsTable
+      Events:
+        UpdateItem:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ItemsApi
+            Path: /items/{id}
+            Method: PUT
+
+  # --- DELETE Item ---
+  DeleteItemFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-delete-item'
+      Handler: handlers/delete_item.handler
+      Description: Delete an item from DynamoDB
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ItemsTable
+      Events:
+        DeleteItem:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ItemsApi
+            Path: /items/{id}
+            Method: DELETE
+
+  ############################################################################
+  # LAMBDA LOG GROUPS
+  # Exam tip: If you don't create log groups explicitly, Lambda creates them
+  # with NEVER EXPIRE retention. Always set a retention policy for cost control.
+  ############################################################################
+  CreateItemLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${CreateItemFunction}'
+      RetentionInDays: 14
+
+  GetItemLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${GetItemFunction}'
+      RetentionInDays: 14
+
+  ListItemsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ListItemsFunction}'
+      RetentionInDays: 14
+
+  UpdateItemLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${UpdateItemFunction}'
+      RetentionInDays: 14
+
+  DeleteItemLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${DeleteItemFunction}'
+      RetentionInDays: 14
+
+  ############################################################################
+  # CLOUDWATCH ALARMS
+  ############################################################################
+
+  # Alarm for Lambda errors across all functions
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-lambda-errors'
+      AlarmDescription: Alarm when Lambda errors exceed threshold
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # Alarm for API Gateway 5xx errors
+  ApiGateway5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-api-5xx-errors'
+      AlarmDescription: Alarm when API Gateway 5xx errors exceed threshold
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub '${EnvironmentName}-items-api'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # Alarm for API Gateway latency
+  ApiGatewayLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-api-high-latency'
+      AlarmDescription: Alarm when API latency exceeds 3 seconds (p99)
+      Namespace: AWS/ApiGateway
+      MetricName: Latency
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub '${EnvironmentName}-items-api'
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 3000    # 3 seconds in milliseconds
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # Alarm for DynamoDB throttled requests
+  DynamoDBThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-dynamodb-throttles'
+      AlarmDescription: Alarm when DynamoDB requests are being throttled
+      Namespace: AWS/DynamoDB
+      MetricName: ThrottledRequests
+      Dimensions:
+        - Name: TableName
+          Value: !Ref ItemsTable
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+################################################################################
+# OUTPUTS
+################################################################################
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${ItemsApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}'
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub '${EnvironmentName}-UserPoolId'
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+
+  DynamoDBTableName:
+    Description: DynamoDB Table Name
+    Value: !Ref ItemsTable
+    Export:
+      Name: !Sub '${EnvironmentName}-ItemsTableName'
+
+  DynamoDBTableArn:
+    Description: DynamoDB Table ARN
+    Value: !GetAtt ItemsTable.Arn
+
+  DynamoDBStreamArn:
+    Description: DynamoDB Stream ARN (for event-driven processing)
+    Value: !GetAtt ItemsTable.StreamArn
+
+  CreateItemFunctionArn:
+    Description: Create Item Lambda Function ARN
+    Value: !GetAtt CreateItemFunction.Arn
+
+  GetItemFunctionArn:
+    Description: Get Item Lambda Function ARN
+    Value: !GetAtt GetItemFunction.Arn
+
+  ListItemsFunctionArn:
+    Description: List Items Lambda Function ARN
+    Value: !GetAtt ListItemsFunction.Arn

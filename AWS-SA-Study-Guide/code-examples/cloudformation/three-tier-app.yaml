@@ -1,0 +1,647 @@
+################################################################################
+# AWS Solutions Architect - Three-Tier Application CloudFormation Template
+################################################################################
+# KEY EXAM CONCEPTS:
+#   - Application Load Balancer (Layer 7) vs Network Load Balancer (Layer 4)
+#   - Auto Scaling: target tracking, step scaling, scheduled scaling
+#   - Launch Templates (preferred over Launch Configurations — deprecated)
+#   - RDS Multi-AZ: synchronous replication, automatic failover (~60-120s)
+#   - Security group chaining: ALB → EC2 → RDS
+#   - CloudWatch alarms trigger Auto Scaling policies and SNS notifications
+################################################################################
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Three-tier application with ALB, Auto Scaling Group, and RDS Multi-AZ.
+  Designed to import VPC resources from the vpc-complete stack.
+
+################################################################################
+# PARAMETERS
+################################################################################
+Parameters:
+  EnvironmentName:
+    Description: Environment name that matches the VPC stack
+    Type: String
+    Default: production
+    AllowedValues:
+      - development
+      - staging
+      - production
+
+  InstanceType:
+    Description: EC2 instance type for the application tier
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - m5.large
+      - m5.xlarge
+    ConstraintDescription: Must be a valid EC2 instance type
+
+  # Exam tip: Use AWS SSM Parameter Store to always reference the latest AMI.
+  # This avoids hardcoding AMI IDs which differ across regions.
+  LatestAmiId:
+    Description: Latest Amazon Linux 2023 AMI from SSM Parameter Store
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+  DBInstanceClass:
+    Description: RDS instance class
+    Type: String
+    Default: db.t3.medium
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+      - db.r5.large
+      - db.r5.xlarge
+
+  DBMasterUsername:
+    Description: Master username for the RDS instance
+    Type: String
+    Default: admin
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+
+  DBMasterPassword:
+    Description: Master password for the RDS instance
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    AllowedPattern: '[a-zA-Z0-9]*'
+
+  MinCapacity:
+    Description: Minimum number of EC2 instances in the ASG
+    Type: Number
+    Default: 2
+    MinValue: 1
+
+  MaxCapacity:
+    Description: Maximum number of EC2 instances in the ASG
+    Type: Number
+    Default: 6
+    MinValue: 2
+
+  NotificationEmail:
+    Description: Email address for SNS notifications
+    Type: String
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+
+Resources:
+  ############################################################################
+  # SNS TOPIC FOR NOTIFICATIONS
+  # Exam tip: SNS supports multiple subscription protocols — email, SMS,
+  # HTTP/HTTPS, SQS, Lambda. SNS uses a pub/sub model. Messages are pushed
+  # to subscribers. Fanout pattern: SNS → multiple SQS queues.
+  ############################################################################
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${EnvironmentName}-app-notifications'
+      DisplayName: Application Notifications
+
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  ############################################################################
+  # APPLICATION LOAD BALANCER
+  # Exam tip: ALB operates at Layer 7 (HTTP/HTTPS). Supports:
+  #   - Path-based routing (/api/* → target group A, /web/* → target group B)
+  #   - Host-based routing (api.example.com → target group A)
+  #   - Fixed response and redirect actions
+  #   - WebSocket and HTTP/2 support
+  #   - Integration with WAF and Cognito
+  # ALB is REGIONAL, spans multiple AZs. Minimum 2 AZs required.
+  # Cross-zone load balancing is ON by default for ALB (off by default for NLB).
+  ############################################################################
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${EnvironmentName}-alb'
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups:
+        - !ImportValue
+          Fn::Sub: '${EnvironmentName}-WebTierSG'
+      Subnets:
+        - !ImportValue
+          Fn::Sub: '${EnvironmentName}-PublicSubnet1Id'
+        - !ImportValue
+          Fn::Sub: '${EnvironmentName}-PublicSubnet2Id'
+      LoadBalancerAttributes:
+        # Exam tip: Access logs capture detailed info about requests.
+        # Useful for debugging, compliance, and traffic analysis.
+        - Key: access_logs.s3.enabled
+          Value: 'false'
+        # Idle timeout: how long to keep connection open if no data is sent.
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+        # Deletion protection prevents accidental deletion.
+        - Key: deletion_protection.enabled
+          Value: 'false'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-alb'
+
+  # Exam tip: Target Groups define where the ALB routes traffic.
+  # Health checks determine if targets are healthy. Unhealthy targets
+  # are automatically removed from rotation.
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${EnvironmentName}-tg'
+      Port: 8080
+      Protocol: HTTP
+      VpcId: !ImportValue
+        Fn::Sub: '${EnvironmentName}-VpcId'
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 3
+      # Exam tip: Deregistration delay (default 300s) allows in-flight
+      # requests to complete before target is removed.
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '60'
+        # Stickiness sends the same client to the same target.
+        - Key: stickiness.enabled
+          Value: 'true'
+        - Key: stickiness.type
+          Value: lb_cookie
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: '3600'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-tg'
+
+  # HTTP Listener — redirects to HTTPS
+  ALBHTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultAction:
+        Type: redirect
+        RedirectConfig:
+          Protocol: HTTPS
+          Port: '443'
+          StatusCode: HTTP_301
+
+  # HTTPS Listener — forwards to target group
+  # NOTE: In production, replace the CertificateArn with a real ACM certificate.
+  # Commented out to allow stack creation without a certificate.
+  # ALBHTTPSListener:
+  #   Type: AWS::ElasticLoadBalancingV2::Listener
+  #   Properties:
+  #     LoadBalancerArn: !Ref ApplicationLoadBalancer
+  #     Port: 443
+  #     Protocol: HTTPS
+  #     SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+  #     Certificates:
+  #       - CertificateArn: !Ref ACMCertificate
+  #     DefaultAction:
+  #       Type: forward
+  #       TargetGroupArn: !Ref ALBTargetGroup
+
+  # For demo purposes, forward HTTP directly to target group
+  ALBHTTPForwardListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 8080
+      Protocol: HTTP
+      DefaultAction:
+        Type: forward
+        TargetGroupArn: !Ref ALBTargetGroup
+
+  ############################################################################
+  # LAUNCH TEMPLATE
+  # Exam tip: Launch Templates are the modern replacement for Launch
+  # Configurations. They support versioning, can be modified after creation,
+  # and support more features (e.g., T2/T3 unlimited, placement groups,
+  # capacity reservations, multiple instance types).
+  ############################################################################
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-ec2-instance-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # SSM allows Session Manager access — no SSH needed (more secure)
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        # CloudWatch agent for custom metrics and logs
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-ec2-role'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${EnvironmentName}-launch-template'
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: '${EnvironmentName}-AppTierSG'
+        # Exam tip: Metadata options enforce IMDSv2, which is more secure.
+        # IMDSv2 requires a session token (PUT request first), protecting
+        # against SSRF attacks.
+        MetadataOptions:
+          HttpTokens: required      # Enforce IMDSv2
+          HttpEndpoint: enabled
+          HttpPutResponseHopLimit: 1
+        Monitoring:
+          Enabled: true    # Detailed monitoring (1-minute intervals vs 5-minute basic)
+        # Exam tip: UserData runs on instance launch. Base64 encoded automatically.
+        # Use cfn-init for complex bootstrapping, cfn-signal for success signaling.
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            yum update -y
+            yum install -y httpd
+            systemctl start httpd
+            systemctl enable httpd
+
+            # Install CloudWatch agent
+            yum install -y amazon-cloudwatch-agent
+
+            # Simple health check endpoint
+            echo '{"status":"healthy"}' > /var/www/html/health
+
+            # Signal CloudFormation that the instance is ready
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} \
+              --resource AutoScalingGroup --region ${AWS::Region}
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${EnvironmentName}-app-server'
+              - Key: Environment
+                Value: !Ref EnvironmentName
+
+  ############################################################################
+  # AUTO SCALING GROUP
+  # Exam tip: ASG ensures desired capacity of instances. Key concepts:
+  #   - Min/Max/Desired capacity
+  #   - Health check types: EC2 (default) or ELB (recommended with ALB)
+  #   - Cooldown period: wait time between scaling activities
+  #   - Scaling policies: target tracking, step, simple, scheduled
+  #   - Instance warm-up: time before new instance counts toward metrics
+  #   - Lifecycle hooks: run custom actions on launch/termination
+  ############################################################################
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${EnvironmentName}-asg'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinCapacity
+      MaxSize: !Ref MaxCapacity
+      DesiredCapacity: !Ref MinCapacity
+      VPCZoneIdentifier:
+        - !ImportValue
+          Fn::Sub: '${EnvironmentName}-PrivateSubnet1Id'
+        - !ImportValue
+          Fn::Sub: '${EnvironmentName}-PrivateSubnet2Id'
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+      # Exam tip: Use ELB health check type when behind a load balancer.
+      # ELB health checks are more thorough (HTTP-based vs just EC2 status).
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      # Exam tip: Termination policies control which instance is terminated
+      # first during scale-in. Default: oldest launch config → closest to
+      # billing hour → random.
+      TerminationPolicies:
+        - OldestLaunchTemplate
+        - OldestInstance
+      NotificationConfigurations:
+        - TopicARN: !Ref NotificationTopic
+          NotificationTypes:
+            - autoscaling:EC2_INSTANCE_LAUNCH
+            - autoscaling:EC2_INSTANCE_TERMINATE
+            - autoscaling:EC2_INSTANCE_LAUNCH_ERROR
+            - autoscaling:EC2_INSTANCE_TERMINATE_ERROR
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-asg-instance'
+          PropagateAtLaunch: true
+    # CreationPolicy waits for cfn-signal from instances before marking the resource as CREATE_COMPLETE.
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref MinCapacity
+        Timeout: PT15M
+    # UpdatePolicy controls how CloudFormation handles updates to the ASG.
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: !Ref MinCapacity
+        MaxBatchSize: 1
+        PauseTime: PT15M
+        WaitOnResourceSignals: true
+        SuspendProcesses:
+          - HealthCheck
+          - ReplaceUnhealthy
+          - AZRebalance
+          - AlarmNotification
+          - ScheduledActions
+
+  ############################################################################
+  # AUTO SCALING POLICIES
+  # Exam tip: Target Tracking is simplest — you set a target metric value and
+  # AWS manages the scaling. Step Scaling allows different scaling amounts
+  # based on alarm breach severity. Scheduled Scaling for predictable patterns.
+  ############################################################################
+
+  # Target Tracking: maintain average CPU at 70%
+  CPUTargetTrackingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 70.0
+        # Exam tip: Disable scale-in to prevent removing instances too quickly.
+        # Useful when you have other mechanisms for scale-in.
+        DisableScaleIn: false
+
+  # Target Tracking: maintain request count per target at 1000
+  RequestCountPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ALBRequestCountPerTarget
+          ResourceLabel: !Sub
+            - '${ALBFullName}/${TGFullName}'
+            - ALBFullName: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+              TGFullName: !GetAtt ALBTargetGroup.TargetGroupFullName
+        TargetValue: 1000.0
+
+  ############################################################################
+  # CLOUDWATCH ALARMS
+  # Exam tip: CloudWatch alarms have 3 states: OK, ALARM, INSUFFICIENT_DATA.
+  # Alarms can trigger Auto Scaling actions, SNS notifications, or EC2 actions.
+  # Composite alarms combine multiple alarms with AND/OR logic.
+  ############################################################################
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-high-cpu'
+      AlarmDescription: Alarm when CPU exceeds 80% for 5 minutes
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      Statistic: Average
+      Period: 300           # 5 minutes
+      EvaluationPeriods: 2  # 2 consecutive periods (10 min total)
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref NotificationTopic
+      OKActions:
+        - !Ref NotificationTopic
+      TreatMissingData: breaching
+
+  # Alarm for unhealthy host count
+  UnhealthyHostAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-unhealthy-hosts'
+      AlarmDescription: Alarm when unhealthy target count is greater than 0
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt ALBTargetGroup.TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref NotificationTopic
+
+  # Alarm for high 5xx error rate
+  High5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-high-5xx-errors'
+      AlarmDescription: Alarm when 5xx errors exceed threshold
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 50
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref NotificationTopic
+
+  ############################################################################
+  # RDS MULTI-AZ
+  # Exam tip: Multi-AZ is for HIGH AVAILABILITY, NOT read scaling.
+  #   - Synchronous replication to standby in different AZ
+  #   - Automatic failover (~60-120 seconds) — DNS endpoint stays the same
+  #   - Standby is NOT accessible for reads (use Read Replicas for that)
+  #   - Backups are taken from the standby (no performance impact on primary)
+  #   - Read Replicas use ASYNCHRONOUS replication and CAN be promoted
+  #   - Encryption at rest uses KMS; must be enabled at creation time
+  #   - Storage Auto Scaling: automatically increases storage when running low
+  ############################################################################
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot    # Takes a final snapshot before deletion
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${EnvironmentName}-mysql'
+      Engine: mysql
+      EngineVersion: '8.0'
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: 20
+      MaxAllocatedStorage: 100    # Enable Storage Auto Scaling up to 100 GB
+      StorageType: gp3
+      MasterUsername: !Ref DBMasterUsername
+      MasterUserPassword: !Ref DBMasterPassword
+      DBSubnetGroupName: !ImportValue
+        Fn::Sub: '${EnvironmentName}-DatabaseSubnetGroup'
+      VPCSecurityGroups:
+        - !ImportValue
+          Fn::Sub: '${EnvironmentName}-DatabaseTierSG'
+      MultiAZ: true
+      # Exam tip: Backup window and maintenance window should not overlap.
+      # Automated backups are retained 1-35 days (0 disables them).
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'Mon:04:00-Mon:05:00'
+      # Exam tip: StorageEncrypted enables encryption at rest using KMS.
+      # Cannot be enabled after instance creation — must recreate.
+      StorageEncrypted: true
+      # Exam tip: Enhanced Monitoring provides OS-level metrics (CPU, memory,
+      # file system, disk I/O) at 1-60 second granularity.
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt RDSMonitoringRole.Arn
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      CopyTagsToSnapshot: true
+      DeletionProtection: false
+      AutoMinorVersionUpgrade: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-mysql'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  RDSMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-rds-monitoring-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+
+  # CloudWatch alarm for RDS CPU
+  RDSHighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-rds-high-cpu'
+      AlarmDescription: RDS CPU utilization above 80%
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref RDSInstance
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref NotificationTopic
+
+  # CloudWatch alarm for RDS free storage space
+  RDSLowStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-rds-low-storage'
+      AlarmDescription: RDS free storage below 5 GB
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref RDSInstance
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5368709120    # 5 GB in bytes
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref NotificationTopic
+
+  # CloudWatch alarm for RDS database connections
+  RDSHighConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-rds-high-connections'
+      AlarmDescription: RDS connection count above threshold
+      Namespace: AWS/RDS
+      MetricName: DatabaseConnections
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref RDSInstance
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref NotificationTopic
+
+################################################################################
+# OUTPUTS
+################################################################################
+Outputs:
+  ALBDNSName:
+    Description: DNS name of the Application Load Balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${EnvironmentName}-ALBDNSName'
+
+  ALBHostedZoneId:
+    Description: Hosted zone ID of the ALB (for Route 53 alias records)
+    Value: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
+
+  ALBArn:
+    Description: ARN of the Application Load Balancer
+    Value: !Ref ApplicationLoadBalancer
+
+  TargetGroupArn:
+    Description: ARN of the ALB Target Group
+    Value: !Ref ALBTargetGroup
+
+  AutoScalingGroupName:
+    Description: Name of the Auto Scaling Group
+    Value: !Ref AutoScalingGroup
+
+  RDSEndpoint:
+    Description: RDS instance endpoint address
+    Value: !GetAtt RDSInstance.Endpoint.Address
+    Export:
+      Name: !Sub '${EnvironmentName}-RDSEndpoint'
+
+  RDSPort:
+    Description: RDS instance port
+    Value: !GetAtt RDSInstance.Endpoint.Port
+
+  SNSTopicArn:
+    Description: ARN of the notification SNS topic
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${EnvironmentName}-SNSTopicArn'
