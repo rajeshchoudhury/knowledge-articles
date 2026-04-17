@@ -1,0 +1,866 @@
+################################################################################
+# AWS Solutions Architect Professional – Multi-Account VPC Infrastructure
+#
+# KEY EXAM TOPICS DEMONSTRATED:
+#   • VPC design with 3-tier subnet strategy (public / private / isolated)
+#   • High-availability NAT Gateway deployment (one per AZ)
+#   • Transit Gateway for hub-and-spoke network topology
+#   • VPC Flow Logs for traffic auditing (PCI-DSS, HIPAA requirement)
+#   • Gateway & Interface VPC Endpoints (cost + security best practice)
+#   • KMS CMK with cross-account key policy
+#   • Layered Security Group architecture
+#
+# ARCHITECTURE NOTES:
+#   The VPC uses a /16 CIDR carved into /20 subnets giving 4,091 usable IPs
+#   per subnet.  Three AZs provide fault tolerance beyond the 99.99% SLA.
+#   Private subnets route through per-AZ NAT Gateways to avoid cross-AZ
+#   data-transfer charges and single-AZ failure blast radius.
+#   Isolated (DB) subnets have NO route to the internet – they can only be
+#   reached from the private (app) tier.
+################################################################################
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Multi-account landing-zone VPC with public/private/isolated subnets,
+  Transit Gateway attachment, VPC endpoints, and KMS cross-account key.
+
+# ---------------------------------------------------------------------------
+# Parameters – allow the template to be reused across accounts / environments
+# ---------------------------------------------------------------------------
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: production
+    AllowedValues: [production, staging, development]
+    Description: Environment tag applied to every resource for cost allocation.
+
+  VpcCidr:
+    Type: String
+    Default: "10.1.0.0/16"
+    AllowedPattern: '(\d{1,3}\.){3}\d{1,3}/\d{1,2}'
+    Description: >
+      Non-overlapping CIDR is critical when using Transit Gateway or VPC
+      peering.  Each spoke VPC must have a unique CIDR in the network.
+
+  TransitGatewayId:
+    Type: String
+    Description: >
+      Transit Gateway shared via AWS RAM from the networking account.
+      TGW enables transitive routing between all spoke VPCs and on-premises
+      via a single attachment instead of a full mesh of VPC peering connections.
+
+  SharedServicesAccountId:
+    Type: String
+    Description: >
+      Account ID of the shared-services account that needs cross-account
+      access to the KMS key (e.g., for centralized CI/CD pipelines).
+
+  FlowLogRetentionDays:
+    Type: Number
+    Default: 90
+    AllowedValues: [30, 60, 90, 180, 365]
+    Description: >
+      Retention period for VPC Flow Logs.  90 days satisfies most compliance
+      frameworks; PCI-DSS requires at least 1 year for audit trails.
+
+# ---------------------------------------------------------------------------
+# Mappings – AZ-aware subnet CIDR allocation
+# ---------------------------------------------------------------------------
+Mappings:
+  # /20 subnets = 4,091 usable IPs each.  Larger than /24 to accommodate
+  # EKS pods, Lambda ENIs, and future growth.
+  SubnetCidrs:
+    az1:
+      Public:   "10.1.0.0/20"
+      Private:  "10.1.16.0/20"
+      Isolated: "10.1.32.0/20"
+    az2:
+      Public:   "10.1.48.0/20"
+      Private:  "10.1.64.0/20"
+      Isolated: "10.1.80.0/20"
+    az3:
+      Public:   "10.1.96.0/20"
+      Private:  "10.1.112.0/20"
+      Isolated: "10.1.128.0/20"
+
+Resources:
+  # =========================================================================
+  # VPC
+  # =========================================================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true      # Required for Interface VPC Endpoints
+      EnableDnsHostnames: true    # Required for private hosted zone resolution
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-vpc"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # =========================================================================
+  # Internet Gateway – only public subnets route here
+  # =========================================================================
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-igw"
+
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # =========================================================================
+  # Public Subnets (3 AZs)
+  # Used for: ALBs, NAT Gateways, bastion hosts
+  # These are the ONLY subnets with a route to the IGW.
+  # =========================================================================
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap [SubnetCidrs, az1, Public]
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-public-1"
+        - Key: kubernetes.io/role/elb
+          Value: "1"  # EKS tag: ALBs target public subnets
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap [SubnetCidrs, az2, Public]
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-public-2"
+        - Key: kubernetes.io/role/elb
+          Value: "1"
+
+  PublicSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap [SubnetCidrs, az3, Public]
+      AvailabilityZone: !Select [2, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-public-3"
+        - Key: kubernetes.io/role/elb
+          Value: "1"
+
+  # =========================================================================
+  # Private Subnets (3 AZs)
+  # Used for: application servers, EKS worker nodes, Lambda ENIs
+  # Route to internet via NAT Gateway (for patching, API calls)
+  # =========================================================================
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap [SubnetCidrs, az1, Private]
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-private-1"
+        - Key: kubernetes.io/role/internal-elb
+          Value: "1"  # EKS tag: internal ALBs target private subnets
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap [SubnetCidrs, az2, Private]
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-private-2"
+        - Key: kubernetes.io/role/internal-elb
+          Value: "1"
+
+  PrivateSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap [SubnetCidrs, az3, Private]
+      AvailabilityZone: !Select [2, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-private-3"
+        - Key: kubernetes.io/role/internal-elb
+          Value: "1"
+
+  # =========================================================================
+  # Isolated Subnets (3 AZs)
+  # Used for: RDS, ElastiCache, Redshift – NO internet access at all
+  # This is the most restrictive tier; traffic enters only from private tier.
+  # =========================================================================
+  IsolatedSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap [SubnetCidrs, az1, Isolated]
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-isolated-1"
+
+  IsolatedSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap [SubnetCidrs, az2, Isolated]
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-isolated-2"
+
+  IsolatedSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap [SubnetCidrs, az3, Isolated]
+      AvailabilityZone: !Select [2, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-isolated-3"
+
+  # =========================================================================
+  # Elastic IPs + NAT Gateways (one per AZ for HA + cost optimization)
+  #
+  # EXAM TIP: A single NAT Gateway is a single point of failure.
+  # Production workloads should deploy one per AZ.  Each NAT GW can handle
+  # up to 55,000 simultaneous connections and 45 Gbps burst bandwidth.
+  # =========================================================================
+  NatEIP1:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttachment
+    Properties:
+      Domain: vpc
+
+  NatEIP2:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttachment
+    Properties:
+      Domain: vpc
+
+  NatEIP3:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP1.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-natgw-1"
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP2.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-natgw-2"
+
+  NatGateway3:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP3.AllocationId
+      SubnetId: !Ref PublicSubnet3
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-natgw-3"
+
+  # =========================================================================
+  # Route Tables
+  # =========================================================================
+
+  # --- Public Route Table (shared across all public subnets) ---
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-public-rt"
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet3RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet3
+      RouteTableId: !Ref PublicRouteTable
+
+  # --- Private Route Tables (one per AZ to route through the local NAT GW) ---
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-private-rt-1"
+
+  PrivateDefaultRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: "0.0.0.0/0"
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-private-rt-2"
+
+  PrivateDefaultRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: "0.0.0.0/0"
+      NatGatewayId: !Ref NatGateway2
+
+  PrivateSubnet2RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable2
+
+  PrivateRouteTable3:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-private-rt-3"
+
+  PrivateDefaultRoute3:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable3
+      DestinationCidrBlock: "0.0.0.0/0"
+      NatGatewayId: !Ref NatGateway3
+
+  PrivateSubnet3RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet3
+      RouteTableId: !Ref PrivateRouteTable3
+
+  # --- Isolated Route Table (NO default route – completely air-gapped) ---
+  IsolatedRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-isolated-rt"
+
+  IsolatedSubnet1RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref IsolatedSubnet1
+      RouteTableId: !Ref IsolatedRouteTable
+
+  IsolatedSubnet2RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref IsolatedSubnet2
+      RouteTableId: !Ref IsolatedRouteTable
+
+  IsolatedSubnet3RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref IsolatedSubnet3
+      RouteTableId: !Ref IsolatedRouteTable
+
+  # =========================================================================
+  # Transit Gateway Attachment
+  #
+  # EXAM TIP: TGW attachments consume one ENI per AZ from the specified
+  # subnets.  Best practice is to use dedicated "transit" subnets, but here
+  # we attach to private subnets for simplicity.  TGW supports transitive
+  # routing, unlike VPC peering which is non-transitive.
+  # =========================================================================
+  TransitGatewayAttachment:
+    Type: AWS::EC2::TransitGatewayAttachment
+    Properties:
+      TransitGatewayId: !Ref TransitGatewayId
+      VpcId: !Ref VPC
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+        - !Ref PrivateSubnet3
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-tgw-attachment"
+
+  # Routes to other spoke VPCs and on-premises via TGW (RFC 1918 summary)
+  TGWRoutePrivate1:
+    Type: AWS::EC2::Route
+    DependsOn: TransitGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: "10.0.0.0/8"
+      TransitGatewayId: !Ref TransitGatewayId
+
+  TGWRoutePrivate2:
+    Type: AWS::EC2::Route
+    DependsOn: TransitGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: "10.0.0.0/8"
+      TransitGatewayId: !Ref TransitGatewayId
+
+  TGWRoutePrivate3:
+    Type: AWS::EC2::Route
+    DependsOn: TransitGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable3
+      DestinationCidrBlock: "10.0.0.0/8"
+      TransitGatewayId: !Ref TransitGatewayId
+
+  # =========================================================================
+  # VPC Flow Logs
+  #
+  # EXAM TIP: Flow Logs capture metadata (src/dst IP, port, action) but NOT
+  # packet payload.  For packet inspection use Traffic Mirroring or a
+  # network appliance.  Flow Logs can publish to CloudWatch Logs or S3.
+  # CloudWatch is preferred when you need real-time metric filters/alarms;
+  # S3 is preferred for long-term, cost-effective storage + Athena queries.
+  # =========================================================================
+  FlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-vpc-flowlog-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FlowLogCloudWatch
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: "*"
+
+  FlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/vpc/flowlogs/${EnvironmentName}"
+      RetentionInDays: !Ref FlowLogRetentionDays
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+
+  VPCFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceId: !Ref VPC
+      ResourceType: VPC
+      TrafficType: ALL       # Capture ACCEPT + REJECT for security analysis
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref FlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogRole.Arn
+      MaxAggregationInterval: 60  # 1-minute granularity (vs default 10 min)
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-vpc-flowlog"
+
+  # =========================================================================
+  # Security Groups – Layered Defence (Web → App → DB)
+  #
+  # EXAM TIP: Security Groups are stateful (return traffic auto-allowed).
+  # NACLs are stateless and evaluated in rule-number order.  Use SGs as the
+  # primary control and NACLs as a coarse-grained backup.
+  # =========================================================================
+
+  # --- Web Tier: ALB-facing, allows inbound 80/443 from the internet ---
+  WebTierSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web tier - ALBs and public-facing services
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+          Description: HTTPS from internet
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+          Description: HTTP from internet (redirect to HTTPS)
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-web-sg"
+
+  # --- App Tier: only accepts traffic from the Web tier SG ---
+  AppTierSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Application tier - ECS/EKS/EC2 workloads
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref WebTierSG
+          Description: App traffic from ALB
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref WebTierSG
+          Description: HTTPS from ALB
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-app-sg"
+
+  # --- DB Tier: only accepts traffic from the App tier SG ---
+  DBTierSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Database tier - RDS, ElastiCache, Redshift
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref AppTierSG
+          Description: PostgreSQL from app tier
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref AppTierSG
+          Description: MySQL from app tier
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref AppTierSG
+          Description: Redis from app tier
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-db-sg"
+
+  # --- VPC Endpoint SG: used by Interface endpoints ---
+  VPCEndpointSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTPS from within VPC to interface endpoints
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: HTTPS from VPC CIDR
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-vpce-sg"
+
+  # =========================================================================
+  # S3 Gateway Endpoint
+  #
+  # EXAM TIP: Gateway endpoints are FREE and route S3/DynamoDB traffic over
+  # the AWS private network (no NAT GW charges).  They are added as a
+  # prefix-list entry in route tables.  This is a top cost-optimization
+  # and security recommendation.
+  # =========================================================================
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable1
+        - !Ref PrivateRouteTable2
+        - !Ref PrivateRouteTable3
+        - !Ref IsolatedRouteTable
+
+  # =========================================================================
+  # DynamoDB Gateway Endpoint (also free – same rationale as S3)
+  # =========================================================================
+  DynamoDBGatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.dynamodb"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable1
+        - !Ref PrivateRouteTable2
+        - !Ref PrivateRouteTable3
+        - !Ref IsolatedRouteTable
+
+  # =========================================================================
+  # Interface VPC Endpoints
+  #
+  # EXAM TIP: Interface endpoints use AWS PrivateLink (ENI in your subnet).
+  # They cost ~$0.01/hr per AZ + $0.01/GB processed.  Worth it when:
+  #   1. Security policy forbids internet egress (no NAT GW)
+  #   2. VPC has no NAT GW and Lambda needs AWS API access
+  #   3. Compliance requires all traffic to stay on private network
+  # Enable PrivateDnsEnabled so standard AWS SDK calls resolve to the
+  # private endpoint automatically (requires DNS support on the VPC).
+  # =========================================================================
+  SSMEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssm"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+        - !Ref PrivateSubnet3
+      SecurityGroupIds:
+        - !Ref VPCEndpointSG
+
+  SSMMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssmmessages"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+        - !Ref PrivateSubnet3
+      SecurityGroupIds:
+        - !Ref VPCEndpointSG
+
+  EC2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ec2messages"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+        - !Ref PrivateSubnet3
+      SecurityGroupIds:
+        - !Ref VPCEndpointSG
+
+  # SSM, SSMMessages, and EC2Messages together enable Session Manager
+  # (replacement for bastion hosts – no SSH keys, no port 22, full audit log)
+
+  CloudWatchLogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.logs"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+        - !Ref PrivateSubnet3
+      SecurityGroupIds:
+        - !Ref VPCEndpointSG
+
+  KMSEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.kms"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+        - !Ref PrivateSubnet3
+      SecurityGroupIds:
+        - !Ref VPCEndpointSG
+
+  STSEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.sts"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+        - !Ref PrivateSubnet3
+      SecurityGroupIds:
+        - !Ref VPCEndpointSG
+
+  # =========================================================================
+  # KMS Customer Managed Key with Cross-Account Access
+  #
+  # EXAM TIP: KMS key policies are the PRIMARY access-control mechanism.
+  # Unlike most AWS resources, KMS keys REQUIRE an explicit key policy
+  # grant – IAM alone is not sufficient.  The key policy below grants:
+  #   1. Local account root – full admin (required or you can lock yourself out)
+  #   2. Shared services account – encrypt/decrypt for CI/CD pipelines
+  # For cross-account access the key policy MUST allow the external account
+  # AND the external account's IAM policy must also allow the KMS actions.
+  # =========================================================================
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "CMK for ${EnvironmentName} - encrypts EBS, RDS, S3, CloudWatch Logs"
+      EnableKeyRotation: true   # Automatic annual rotation (compliance requirement)
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: cross-account-key-policy
+        Statement:
+          # Allow local account full admin – NEVER remove this or you lose access
+          - Sid: AllowLocalAccountAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+
+          # Allow shared-services account to use the key for encrypt/decrypt
+          - Sid: AllowCrossAccountUse
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${SharedServicesAccountId}:root"
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+
+          # Allow shared-services account to create grants (needed for EBS, RDS)
+          - Sid: AllowCrossAccountGrants
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${SharedServicesAccountId}:root"
+            Action:
+              - kms:CreateGrant
+              - kms:ListGrants
+              - kms:RevokeGrant
+            Resource: "*"
+            Condition:
+              Bool:
+                kms:GrantIsForAWSResource: "true"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-cmk"
+
+  EncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${EnvironmentName}-cmk"
+      TargetKeyId: !Ref EncryptionKey
+
+# ---------------------------------------------------------------------------
+# Outputs – export values for cross-stack references
+# ---------------------------------------------------------------------------
+Outputs:
+  VpcId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub "${EnvironmentName}-VpcId"
+
+  PublicSubnetIds:
+    Description: Comma-delimited list of public subnet IDs
+    Value: !Join [",", [!Ref PublicSubnet1, !Ref PublicSubnet2, !Ref PublicSubnet3]]
+    Export:
+      Name: !Sub "${EnvironmentName}-PublicSubnetIds"
+
+  PrivateSubnetIds:
+    Description: Comma-delimited list of private subnet IDs
+    Value: !Join [",", [!Ref PrivateSubnet1, !Ref PrivateSubnet2, !Ref PrivateSubnet3]]
+    Export:
+      Name: !Sub "${EnvironmentName}-PrivateSubnetIds"
+
+  IsolatedSubnetIds:
+    Description: Comma-delimited list of isolated (DB) subnet IDs
+    Value: !Join [",", [!Ref IsolatedSubnet1, !Ref IsolatedSubnet2, !Ref IsolatedSubnet3]]
+    Export:
+      Name: !Sub "${EnvironmentName}-IsolatedSubnetIds"
+
+  WebTierSecurityGroup:
+    Description: Web tier security group ID
+    Value: !Ref WebTierSG
+    Export:
+      Name: !Sub "${EnvironmentName}-WebTierSG"
+
+  AppTierSecurityGroup:
+    Description: App tier security group ID
+    Value: !Ref AppTierSG
+    Export:
+      Name: !Sub "${EnvironmentName}-AppTierSG"
+
+  DBTierSecurityGroup:
+    Description: DB tier security group ID
+    Value: !Ref DBTierSG
+    Export:
+      Name: !Sub "${EnvironmentName}-DBTierSG"
+
+  KmsKeyArn:
+    Description: KMS CMK ARN for encryption
+    Value: !GetAtt EncryptionKey.Arn
+    Export:
+      Name: !Sub "${EnvironmentName}-KmsKeyArn"
+
+  TransitGatewayAttachmentId:
+    Description: TGW attachment ID for route table association
+    Value: !Ref TransitGatewayAttachment
+    Export:
+      Name: !Sub "${EnvironmentName}-TGWAttachmentId"

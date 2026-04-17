@@ -1,0 +1,916 @@
+################################################################################
+# AWS Solutions Architect Professional – Serverless Application Stack
+#
+# KEY EXAM TOPICS DEMONSTRATED:
+#   • SAM (Serverless Application Model) transforms for concise Lambda syntax
+#   • API Gateway REST API with Lambda authorizer (token-based auth)
+#   • Multiple Lambda functions with least-privilege IAM
+#   • DynamoDB with GSI and Application Auto Scaling
+#   • SQS with Dead Letter Queue (poison-pill message handling)
+#   • SNS with subscription filter policies
+#   • Step Functions for orchestrating multi-step workflows
+#   • EventBridge scheduled rules
+#   • X-Ray distributed tracing end-to-end
+#   • CloudWatch alarms and dashboards for operational visibility
+#
+# EXAM TIP: SAM is a superset of CloudFormation.  The AWS::Serverless
+# transform expands to standard CFN resources at deploy time.  SAM
+# simplifies Lambda + API Gateway + DynamoDB patterns significantly.
+################################################################################
+
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Production-grade serverless order processing application with
+  API Gateway, Lambda, DynamoDB, SQS, SNS, Step Functions, and EventBridge.
+
+Globals:
+  # Global defaults applied to ALL Lambda functions in this template
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 256
+    Tracing: Active            # X-Ray tracing on every function
+    Environment:
+      Variables:
+        ORDERS_TABLE: !Ref OrdersTable
+        POWERTOOLS_SERVICE_NAME: order-service
+        LOG_LEVEL: INFO
+    Tags:
+      Application: order-service
+
+  Api:
+    TracingEnabled: true       # X-Ray tracing on API Gateway
+    EndpointConfiguration: REGIONAL
+
+Parameters:
+  StageName:
+    Type: String
+    Default: prod
+    AllowedValues: [prod, staging, dev]
+
+  AlertEmail:
+    Type: String
+    Description: Email for operational alerts.
+
+Resources:
+  # =========================================================================
+  # DynamoDB Table with GSI and Auto Scaling
+  #
+  # EXAM TIP: On-demand mode scales instantly but costs more per request.
+  # Provisioned mode with auto scaling is cheaper for predictable workloads.
+  # GSIs have their own capacity and must be scaled independently.
+  # =========================================================================
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${StageName}-orders"
+      BillingMode: PROVISIONED
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: customerId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: customer-orders
+          KeySchema:
+            - AttributeName: customerId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: 10
+            WriteCapacityUnits: 10
+        - IndexName: status-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: KEYS_ONLY   # Minimize storage for status queries
+          ProvisionedThroughput:
+            ReadCapacityUnits: 5
+            WriteCapacityUnits: 5
+      ProvisionedThroughput:
+        ReadCapacityUnits: 20
+        WriteCapacityUnits: 20
+
+  # Auto Scaling for table and GSI read/write capacity
+  OrdersTableWriteScaling:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 1000
+      MinCapacity: 20
+      ResourceId: !Sub "table/${OrdersTable}"
+      ScalableDimension: dynamodb:table:WriteCapacityUnits
+      ServiceNamespace: dynamodb
+
+  OrdersTableWriteScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: WriteAutoScaling
+      PolicyType: TargetTrackingScaling
+      ScalableTargetId: !Ref OrdersTableWriteScaling
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 70.0          # Scale when consumed capacity hits 70%
+        PredefinedMetricSpecification:
+          PredefinedMetricType: DynamoDBWriteCapacityUtilization
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
+
+  OrdersTableReadScaling:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 2000
+      MinCapacity: 20
+      ResourceId: !Sub "table/${OrdersTable}"
+      ScalableDimension: dynamodb:table:ReadCapacityUnits
+      ServiceNamespace: dynamodb
+
+  OrdersTableReadScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: ReadAutoScaling
+      PolicyType: TargetTrackingScaling
+      ScalableTargetId: !Ref OrdersTableReadScaling
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 70.0
+        PredefinedMetricSpecification:
+          PredefinedMetricType: DynamoDBReadCapacityUtilization
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
+
+  # =========================================================================
+  # SQS Queue with Dead Letter Queue
+  #
+  # EXAM TIP: Always pair an SQS queue with a DLQ.  maxReceiveCount
+  # determines how many times a message is retried before being sent to
+  # the DLQ.  The DLQ retention should be >= source queue retention.
+  # Lambda event source mapping handles polling automatically.
+  # =========================================================================
+  OrderProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${StageName}-order-processing"
+      VisibilityTimeout: 180     # 6x Lambda timeout (best practice)
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrderDLQ.Arn
+        maxReceiveCount: 3       # Move to DLQ after 3 failures
+
+  OrderDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${StageName}-order-processing-dlq"
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: alias/aws/sqs
+
+  # =========================================================================
+  # SNS Topic with Subscription Filtering
+  #
+  # EXAM TIP: Filter policies allow subscribers to receive only relevant
+  # messages without the publisher needing to know about subscribers.
+  # This is a key decoupling pattern.  Filtering happens at the SNS
+  # service level (no compute cost for filtered-out messages).
+  # =========================================================================
+  OrderEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${StageName}-order-events"
+      KmsMasterKeyId: alias/aws/sns
+
+  # Subscription: only receives messages where eventType = "order.completed"
+  FulfillmentSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref OrderEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt OrderProcessingQueue.Arn
+      FilterPolicy:
+        eventType:
+          - order.completed
+      FilterPolicyScope: MessageAttributes
+      RawMessageDelivery: true   # Send raw JSON (not SNS envelope wrapper)
+
+  # Allow SNS to send messages to SQS
+  SQSPolicyForSNS:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref OrderProcessingQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt OrderProcessingQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref OrderEventsTopic
+
+  # =========================================================================
+  # Lambda Authorizer for API Gateway
+  #
+  # EXAM TIP: Lambda authorizers (formerly "custom authorizers") give
+  # full control over auth logic.  TOKEN type validates bearer tokens.
+  # REQUEST type can inspect headers, query strings, and context.
+  # Results are cached for the TTL to reduce Lambda invocations.
+  # =========================================================================
+  AuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${StageName}-api-authorizer"
+      Handler: index.handler
+      InlineCode: |
+        """
+        Lambda authorizer for API Gateway (TOKEN type).
+        Validates JWT tokens and returns an IAM policy document.
+        
+        EXAM TIP: The returned policy is cached by API Gateway
+        for the specified TTL.  The principalId is passed to
+        downstream Lambda functions via event.requestContext.
+        """
+        import json
+
+        def handler(event, context):
+            token = event.get("authorizationToken", "")
+            method_arn = event["methodArn"]
+            
+            # In production: validate JWT signature, expiry, claims
+            # Here simplified for exam study purposes
+            if token.startswith("Bearer ") and validate_token(token[7:]):
+                return generate_policy("user", "Allow", method_arn)
+            
+            return generate_policy("user", "Deny", method_arn)
+
+        def validate_token(token):
+            """Validate token against identity provider (Cognito, Auth0, etc.)."""
+            # Placeholder: in production use PyJWT to validate signature
+            return token and len(token) > 10
+
+        def generate_policy(principal_id, effect, resource):
+            """Generate IAM policy document for API Gateway."""
+            # Wildcard the method/resource to allow cache reuse across endpoints
+            arn_parts = resource.split(":")
+            region = arn_parts[3]
+            account_id = arn_parts[4]
+            api_gw_arn = arn_parts[5].split("/")
+            api_id = api_gw_arn[0]
+            stage = api_gw_arn[1]
+            
+            resource_arn = f"arn:aws:execute-api:{region}:{account_id}:{api_id}/{stage}/*"
+            
+            return {
+                "principalId": principal_id,
+                "policyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Action": "execute-api:Invoke",
+                        "Effect": effect,
+                        "Resource": resource_arn
+                    }]
+                },
+                "context": {
+                    "userId": principal_id
+                }
+            }
+
+  # =========================================================================
+  # API Gateway REST API
+  # =========================================================================
+  OrderApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref StageName
+      Auth:
+        DefaultAuthorizer: TokenAuthorizer
+        Authorizers:
+          TokenAuthorizer:
+            FunctionArn: !GetAtt AuthorizerFunction.Arn
+            Identity:
+              Header: Authorization
+              ReauthorizeEvery: 300    # Cache auth result for 5 minutes
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp",
+          "caller":"$context.identity.caller","user":"$context.identity.user",
+          "requestTime":"$context.requestTime","httpMethod":"$context.httpMethod",
+          "resourcePath":"$context.resourcePath","status":"$context.status",
+          "protocol":"$context.protocol","responseLength":"$context.responseLength",
+          "integrationLatency":"$context.integrationLatency"}
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingBurstLimit: 500
+          ThrottlingRateLimit: 1000
+          MetricsEnabled: true
+          DataTraceEnabled: false    # Never log request/response bodies in prod
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${StageName}-order-api"
+      RetentionInDays: 90
+
+  # =========================================================================
+  # Lambda Functions – Each with least-privilege IAM
+  #
+  # EXAM TIP: SAM Policies use policy templates that expand to minimal IAM
+  # statements.  Always prefer specific resource ARNs over wildcards.
+  # =========================================================================
+
+  # --- Create Order ---
+  CreateOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${StageName}-create-order"
+      Handler: index.handler
+      ReservedConcurrentExecutions: 100
+      Events:
+        CreateOrder:
+          Type: Api
+          Properties:
+            RestApiId: !Ref OrderApi
+            Path: /orders
+            Method: POST
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - SNSPublishMessagePolicy:
+            TopicArn: !Ref OrderEventsTopic
+      InlineCode: |
+        """Create a new order and publish event to SNS."""
+        import json
+        import os
+        import uuid
+        from datetime import datetime, timezone
+        import boto3
+
+        dynamodb = boto3.resource("dynamodb")
+        sns = boto3.client("sns")
+        table = dynamodb.Table(os.environ["ORDERS_TABLE"])
+        TOPIC_ARN = os.environ.get("ORDER_EVENTS_TOPIC")
+
+        def handler(event, context):
+            body = json.loads(event["body"])
+            order_id = str(uuid.uuid4())
+            now = datetime.now(timezone.utc).isoformat()
+            
+            item = {
+                "orderId": order_id,
+                "customerId": body["customerId"],
+                "items": body["items"],
+                "total": body["total"],
+                "status": "PENDING",
+                "createdAt": now,
+                "updatedAt": now,
+            }
+            
+            table.put_item(Item=item)
+            
+            if TOPIC_ARN:
+                sns.publish(
+                    TopicArn=TOPIC_ARN,
+                    Message=json.dumps(item, default=str),
+                    MessageAttributes={
+                        "eventType": {
+                            "DataType": "String",
+                            "StringValue": "order.created"
+                        }
+                    }
+                )
+            
+            return {
+                "statusCode": 201,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({"orderId": order_id, "status": "PENDING"})
+            }
+      Environment:
+        Variables:
+          ORDER_EVENTS_TOPIC: !Ref OrderEventsTopic
+
+  # --- Get Order ---
+  GetOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${StageName}-get-order"
+      Handler: index.handler
+      Events:
+        GetOrder:
+          Type: Api
+          Properties:
+            RestApiId: !Ref OrderApi
+            Path: /orders/{orderId}
+            Method: GET
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref OrdersTable
+      InlineCode: |
+        """Retrieve an order by ID."""
+        import json
+        import os
+        import boto3
+
+        dynamodb = boto3.resource("dynamodb")
+        table = dynamodb.Table(os.environ["ORDERS_TABLE"])
+
+        def handler(event, context):
+            order_id = event["pathParameters"]["orderId"]
+            result = table.get_item(Key={"orderId": order_id})
+            
+            if "Item" not in result:
+                return {
+                    "statusCode": 404,
+                    "body": json.dumps({"error": "Order not found"})
+                }
+            
+            return {
+                "statusCode": 200,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps(result["Item"], default=str)
+            }
+
+  # --- Process Order (SQS consumer) ---
+  ProcessOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${StageName}-process-order"
+      Handler: index.handler
+      Timeout: 30
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OrderProcessingQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 5
+            FunctionResponseTypes:
+              - ReportBatchItemFailures  # Partial batch failure support
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - SNSPublishMessagePolicy:
+            TopicArn: !Ref OrderEventsTopic
+      InlineCode: |
+        """
+        Process orders from SQS queue.
+        
+        EXAM TIP: ReportBatchItemFailures allows Lambda to report which
+        specific messages in a batch failed, so only those are retried.
+        Without it, the entire batch is retried on any single failure.
+        """
+        import json
+        import os
+        import boto3
+        from datetime import datetime, timezone
+
+        dynamodb = boto3.resource("dynamodb")
+        sns = boto3.client("sns")
+        table = dynamodb.Table(os.environ["ORDERS_TABLE"])
+        TOPIC_ARN = os.environ.get("ORDER_EVENTS_TOPIC")
+
+        def handler(event, context):
+            failures = []
+            
+            for record in event["Records"]:
+                try:
+                    order = json.loads(record["body"])
+                    process_single_order(order)
+                except Exception as e:
+                    print(f"Failed to process message {record['messageId']}: {e}")
+                    failures.append({"itemIdentifier": record["messageId"]})
+            
+            return {"batchItemFailures": failures}
+
+        def process_single_order(order):
+            now = datetime.now(timezone.utc).isoformat()
+            table.update_item(
+                Key={"orderId": order["orderId"]},
+                UpdateExpression="SET #s = :s, updatedAt = :u",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={":s": "PROCESSING", ":u": now}
+            )
+            
+            if TOPIC_ARN:
+                sns.publish(
+                    TopicArn=TOPIC_ARN,
+                    Message=json.dumps(order, default=str),
+                    MessageAttributes={
+                        "eventType": {
+                            "DataType": "String",
+                            "StringValue": "order.processing"
+                        }
+                    }
+                )
+      Environment:
+        Variables:
+          ORDER_EVENTS_TOPIC: !Ref OrderEventsTopic
+
+  # =========================================================================
+  # Step Functions State Machine – Order Fulfillment Workflow
+  #
+  # EXAM TIP: Step Functions Standard Workflows are for long-running (up to
+  # 1 year) orchestrations with exactly-once execution.  Express Workflows
+  # are for high-volume, short-duration (up to 5 minutes) at-least-once.
+  # Use Standard for order fulfillment; Express for real-time streaming.
+  # =========================================================================
+  OrderFulfillmentStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub "${StageName}-order-fulfillment"
+      Type: STANDARD
+      Tracing:
+        Enabled: true
+      Logging:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StepFunctionLogGroup.Arn
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ProcessOrderFunction
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - SNSPublishMessagePolicy:
+            TopicArn: !Ref OrderEventsTopic
+        - CloudWatchLogsFullAccess
+      Definition:
+        Comment: Order fulfillment workflow with validation, payment, and shipping
+        StartAt: ValidateOrder
+        States:
+          ValidateOrder:
+            Type: Task
+            Resource: arn:aws:states:::dynamodb:getItem
+            Parameters:
+              TableName: !Ref OrdersTable
+              Key:
+                orderId:
+                  S.$: $.orderId
+            ResultPath: $.orderDetails
+            Next: CheckInventory
+
+          CheckInventory:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: !Ref ProcessOrderFunction
+              Payload.$: $
+            ResultPath: $.inventoryResult
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 2
+                MaxAttempts: 3
+                BackoffRate: 2.0
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: OrderFailed
+            Next: ProcessPayment
+
+          ProcessPayment:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke.waitForTaskToken
+            Parameters:
+              FunctionName: !Ref ProcessOrderFunction
+              Payload:
+                orderId.$: $.orderId
+                taskToken.$: $$.Task.Token
+            TimeoutSeconds: 86400   # 24-hour payment processing timeout
+            Catch:
+              - ErrorEquals: [States.Timeout]
+                ResultPath: $.error
+                Next: OrderFailed
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: OrderFailed
+            Next: ShipOrder
+
+          ShipOrder:
+            Type: Task
+            Resource: arn:aws:states:::sns:publish
+            Parameters:
+              TopicArn: !Ref OrderEventsTopic
+              Message:
+                orderId.$: $.orderId
+                action: ship
+              MessageAttributes:
+                eventType:
+                  DataType: String
+                  StringValue: order.completed
+            Next: OrderCompleted
+
+          OrderCompleted:
+            Type: Succeed
+
+          OrderFailed:
+            Type: Task
+            Resource: arn:aws:states:::sns:publish
+            Parameters:
+              TopicArn: !Ref OrderEventsTopic
+              Message:
+                orderId.$: $.orderId
+                error.$: $.error
+              MessageAttributes:
+                eventType:
+                  DataType: String
+                  StringValue: order.failed
+            Next: FailState
+
+          FailState:
+            Type: Fail
+            Error: OrderProcessingFailed
+            Cause: "Order could not be fulfilled"
+
+  StepFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/stepfunctions/${StageName}-order-fulfillment"
+      RetentionInDays: 90
+
+  # =========================================================================
+  # EventBridge Rule – Scheduled Cleanup
+  #
+  # EXAM TIP: EventBridge (formerly CloudWatch Events) supports:
+  #   1. Schedule expressions (cron/rate)
+  #   2. Event pattern matching (event-driven)
+  #   3. Cross-account/cross-region event bus
+  # The default event bus receives all AWS service events.
+  # =========================================================================
+  DailyCleanupRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${StageName}-daily-order-cleanup"
+      Description: Clean up stale pending orders daily at midnight UTC
+      ScheduleExpression: "cron(0 0 * * ? *)"
+      State: ENABLED
+      Targets:
+        - Id: CleanupTarget
+          Arn: !GetAtt CleanupFunction.Arn
+
+  CleanupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${StageName}-order-cleanup"
+      Handler: index.handler
+      Timeout: 300
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+      InlineCode: |
+        """Clean up stale PENDING orders older than 24 hours."""
+        import os
+        import boto3
+        from datetime import datetime, timedelta, timezone
+
+        dynamodb = boto3.resource("dynamodb")
+        table = dynamodb.Table(os.environ["ORDERS_TABLE"])
+
+        def handler(event, context):
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+            
+            response = table.query(
+                IndexName="status-index",
+                KeyConditionExpression="#s = :status AND createdAt < :cutoff",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={":status": "PENDING", ":cutoff": cutoff}
+            )
+            
+            cancelled = 0
+            for item in response.get("Items", []):
+                table.update_item(
+                    Key={"orderId": item["orderId"]},
+                    UpdateExpression="SET #s = :s",
+                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeValues={":s": "CANCELLED"}
+                )
+                cancelled += 1
+            
+            print(f"Cancelled {cancelled} stale orders")
+            return {"cancelledOrders": cancelled}
+
+  CleanupPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CleanupFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyCleanupRule.Arn
+
+  # =========================================================================
+  # CloudWatch Alarms and Dashboard
+  # =========================================================================
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${StageName}-order-alerts"
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # Alarm: API 5xx error rate
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${StageName}-api-5xx-errors"
+      AlarmDescription: API Gateway 5xx error rate exceeds 1%
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref OrderApi
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0.01
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # Alarm: Lambda errors
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${StageName}-lambda-errors"
+      AlarmDescription: Lambda function errors exceed threshold
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CreateOrderFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # Alarm: DLQ has messages (indicates processing failures)
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${StageName}-dlq-messages"
+      AlarmDescription: >
+        Messages in DLQ indicate repeated processing failures.
+        Investigate ProcessOrderFunction logs.
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt OrderDLQ.QueueName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # Alarm: DynamoDB throttling
+  DynamoDBThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${StageName}-dynamodb-throttles"
+      AlarmDescription: >
+        DynamoDB throttling detected.  Consider increasing provisioned
+        capacity or switching to on-demand mode.
+      MetricName: WriteThrottleEvents
+      Namespace: AWS/DynamoDB
+      Dimensions:
+        - Name: TableName
+          Value: !Ref OrdersTable
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # Operational Dashboard
+  OperationalDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${StageName}-order-service"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "API Gateway Requests",
+                "metrics": [
+                  ["AWS/ApiGateway", "Count", "ApiName", "${OrderApi}", {"stat": "Sum"}],
+                  ["AWS/ApiGateway", "5XXError", "ApiName", "${OrderApi}", {"stat": "Sum"}],
+                  ["AWS/ApiGateway", "4XXError", "ApiName", "${OrderApi}", {"stat": "Sum"}]
+                ],
+                "period": 300,
+                "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "API Latency",
+                "metrics": [
+                  ["AWS/ApiGateway", "Latency", "ApiName", "${OrderApi}", {"stat": "p50"}],
+                  ["AWS/ApiGateway", "Latency", "ApiName", "${OrderApi}", {"stat": "p90"}],
+                  ["AWS/ApiGateway", "Latency", "ApiName", "${OrderApi}", {"stat": "p99"}]
+                ],
+                "period": 300,
+                "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda Duration",
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${CreateOrderFunction}", {"stat": "p50"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${GetOrderFunction}", {"stat": "p50"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${ProcessOrderFunction}", {"stat": "p50"}]
+                ],
+                "period": 300,
+                "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "SQS Queue Depth",
+                "metrics": [
+                  ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${OrderProcessingQueue.QueueName}"],
+                  ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${OrderDLQ.QueueName}"]
+                ],
+                "period": 60,
+                "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 12, "width": 24, "height": 6,
+              "properties": {
+                "title": "DynamoDB Consumed Capacity",
+                "metrics": [
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${OrdersTable}", {"stat": "Sum"}],
+                  ["AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "${OrdersTable}", {"stat": "Sum"}],
+                  ["AWS/DynamoDB", "WriteThrottleEvents", "TableName", "${OrdersTable}", {"stat": "Sum"}],
+                  ["AWS/DynamoDB", "ReadThrottleEvents", "TableName", "${OrdersTable}", {"stat": "Sum"}]
+                ],
+                "period": 300,
+                "region": "${AWS::Region}"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${OrderApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+
+  OrdersTableName:
+    Description: DynamoDB table name
+    Value: !Ref OrdersTable
+
+  OrderProcessingQueueUrl:
+    Description: SQS queue URL
+    Value: !Ref OrderProcessingQueue
+
+  StateMachineArn:
+    Description: Step Functions state machine ARN
+    Value: !Ref OrderFulfillmentStateMachine
+
+  DashboardUrl:
+    Description: CloudWatch dashboard URL
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home#dashboards:name=${StageName}-order-service"

@@ -1,0 +1,652 @@
+################################################################################
+# AWS Solutions Architect Professional – Disaster Recovery Infrastructure
+#
+# KEY EXAM TOPICS DEMONSTRATED:
+#   • Aurora Global Database (RPO < 1 second, RTO < 1 minute with managed failover)
+#   • DynamoDB Global Tables (active-active multi-region, automatic replication)
+#   • S3 Cross-Region Replication (CRR) with versioning
+#   • Route 53 health checks + failover routing policy
+#   • Automated failover via Lambda + SNS notifications
+#   • CloudWatch alarms for DR monitoring
+#
+# DR STRATEGY: Warm Standby
+#   Primary region runs full production workload.
+#   Secondary region has Aurora read replica (promoted on failover),
+#   DynamoDB Global Table (active-active), and replicated S3 data.
+#   RTO target: < 5 minutes  |  RPO target: < 1 minute
+#
+# EXAM TIP – DR Strategies (increasing cost & decreasing RTO):
+#   1. Backup & Restore     – RTO hours,   RPO hours   (cheapest)
+#   2. Pilot Light           – RTO minutes, RPO minutes
+#   3. Warm Standby          – RTO minutes, RPO seconds (this template)
+#   4. Multi-Site Active     – RTO ~0,      RPO ~0      (most expensive)
+################################################################################
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Disaster recovery infrastructure: Aurora Global DB, DynamoDB Global Table,
+  S3 CRR, Route 53 failover, Lambda auto-failover, and monitoring.
+
+Parameters:
+  PrimaryRegion:
+    Type: String
+    Default: us-east-1
+
+  SecondaryRegion:
+    Type: String
+    Default: us-west-2
+
+  DomainName:
+    Type: String
+    Default: app.example.com
+    Description: FQDN used for Route 53 failover records.
+
+  HostedZoneId:
+    Type: String
+    Description: Route 53 hosted zone ID for the domain.
+
+  PrimaryALBDnsName:
+    Type: String
+    Description: DNS name of the ALB in the primary region.
+
+  PrimaryALBHostedZoneId:
+    Type: String
+    Description: Hosted zone ID of the primary ALB (region-specific).
+
+  SecondaryALBDnsName:
+    Type: String
+    Description: DNS name of the ALB in the secondary region.
+
+  SecondaryALBHostedZoneId:
+    Type: String
+    Description: Hosted zone ID of the secondary ALB.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for Lambda and Aurora.
+
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets (at least 2 AZs) for Aurora and Lambda.
+
+  AlertEmail:
+    Type: String
+    Description: Email for DR alert notifications.
+
+Resources:
+  # =========================================================================
+  # Aurora Global Database
+  #
+  # EXAM TIP: Aurora Global Database uses storage-level replication (not
+  # binlog) with typical lag < 1 second.  Managed planned failover promotes
+  # a secondary cluster with zero data loss.  Unplanned failover (detach +
+  # promote) may lose the last ~1 second of transactions.
+  #
+  # The Global Database resource itself is region-agnostic; you deploy the
+  # primary cluster in one region and secondary cluster(s) in other regions
+  # via separate CloudFormation stacks.
+  # =========================================================================
+  AuroraKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Encryption key for Aurora Global Database
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowRootAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+
+  AuroraSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnets for Aurora Global DB cluster
+      SubnetIds: !Ref PrivateSubnetIds
+
+  # Primary Aurora Cluster (part of the global database)
+  AuroraGlobalCluster:
+    Type: AWS::RDS::GlobalCluster
+    Properties:
+      GlobalClusterIdentifier: dr-demo-global-cluster
+      Engine: aurora-postgresql
+      EngineVersion: "15.4"
+      StorageEncrypted: true
+      DeletionProtection: true
+
+  AuroraPrimaryCluster:
+    Type: AWS::RDS::DBCluster
+    DependsOn: AuroraGlobalCluster
+    Properties:
+      GlobalClusterIdentifier: dr-demo-global-cluster
+      Engine: aurora-postgresql
+      EngineVersion: "15.4"
+      MasterUsername: dbadmin
+      ManageMasterUserPassword: true   # Secrets Manager auto-rotation
+      DBSubnetGroupName: !Ref AuroraSubnetGroup
+      StorageEncrypted: true
+      KmsKeyId: !Ref AuroraKMSKey
+      BackupRetentionPeriod: 35        # Max retention for point-in-time recovery
+      PreferredBackupWindow: "03:00-04:00"
+      DeletionProtection: true
+      EnableCloudwatchLogsExports:
+        - postgresql
+      Tags:
+        - Key: DR-Role
+          Value: primary
+
+  AuroraPrimaryInstance1:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref AuroraPrimaryCluster
+      DBInstanceClass: db.r6g.xlarge
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 731  # 2 years (free tier = 7 days)
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt RDSEnhancedMonitoringRole.Arn
+
+  AuroraPrimaryInstance2:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref AuroraPrimaryCluster
+      DBInstanceClass: db.r6g.xlarge
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 731
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt RDSEnhancedMonitoringRole.Arn
+
+  RDSEnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+
+  # =========================================================================
+  # DynamoDB Global Table
+  #
+  # EXAM TIP: Global Tables use last-writer-wins reconciliation.  Eventual
+  # consistency across regions (typically < 1 second).  You MUST enable
+  # DynamoDB Streams to use Global Tables.  Active-active means both
+  # regions can accept writes simultaneously.
+  # =========================================================================
+  OrdersTable:
+    Type: AWS::DynamoDB::GlobalTable
+    Properties:
+      TableName: dr-demo-orders
+      BillingMode: PAY_PER_REQUEST   # On-demand = no capacity planning needed
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES  # Required for Global Tables
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: customerId
+          AttributeType: S
+        - AttributeName: orderDate
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: customer-orders-index
+          KeySchema:
+            - AttributeName: customerId
+              KeyType: HASH
+            - AttributeName: orderDate
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      Replicas:
+        - Region: !Ref PrimaryRegion
+          PointInTimeRecoverySpecification:
+            PointInTimeRecoveryEnabled: true
+          Tags:
+            - Key: DR-Role
+              Value: primary
+        - Region: !Ref SecondaryRegion
+          PointInTimeRecoverySpecification:
+            PointInTimeRecoveryEnabled: true
+          Tags:
+            - Key: DR-Role
+              Value: secondary
+
+  # =========================================================================
+  # S3 Bucket with Cross-Region Replication
+  #
+  # EXAM TIP: CRR requires versioning on BOTH source and destination.
+  # Replication is asynchronous.  RTC (Replication Time Control) guarantees
+  # 99.99% of objects replicated within 15 minutes (SLA-backed).
+  # Delete markers are NOT replicated by default (must opt in).
+  # =========================================================================
+  ReplicationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3ReplicationPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetReplicationConfiguration
+                  - s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::dr-demo-primary-${AWS::AccountId}"
+              - Effect: Allow
+                Action:
+                  - s3:GetObjectVersionForReplication
+                  - s3:GetObjectVersionAcl
+                  - s3:GetObjectVersionTagging
+                Resource: !Sub "arn:aws:s3:::dr-demo-primary-${AWS::AccountId}/*"
+              - Effect: Allow
+                Action:
+                  - s3:ReplicateObject
+                  - s3:ReplicateDelete
+                  - s3:ReplicateTags
+                Resource: !Sub "arn:aws:s3:::dr-demo-secondary-${AWS::AccountId}/*"
+
+  PrimaryBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "dr-demo-primary-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled                # Required for replication
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref AuroraKMSKey
+            BucketKeyEnabled: true     # Reduces KMS API calls by 99%
+      ReplicationConfiguration:
+        Role: !GetAtt ReplicationRole.Arn
+        Rules:
+          - Id: FullBucketReplication
+            Status: Enabled
+            Destination:
+              Bucket: !Sub "arn:aws:s3:::dr-demo-secondary-${AWS::AccountId}"
+              StorageClass: STANDARD_IA
+              ReplicationTime:
+                Status: Enabled
+                Time:
+                  Minutes: 15          # RTC: SLA-backed 15-minute guarantee
+              Metrics:
+                Status: Enabled
+                EventThreshold:
+                  Minutes: 15
+            Filter:
+              Prefix: ""               # Replicate everything
+            DeleteMarkerReplication:
+              Status: Enabled          # Replicate deletes for full DR fidelity
+
+  SecondaryBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "dr-demo-secondary-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+            BucketKeyEnabled: true
+
+  # =========================================================================
+  # Route 53 Health Check and Failover Records
+  #
+  # EXAM TIP: Route 53 health checks evaluate endpoint health every 10 or
+  # 30 seconds.  Fast health checks (10s) with a threshold of 1 give
+  # fastest failover (~10-20 seconds detection + TTL propagation).
+  # Failover routing policy automatically directs traffic to secondary
+  # when primary health check fails.
+  # =========================================================================
+  PrimaryHealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Properties:
+      HealthCheckConfig:
+        FullyQualifiedDomainName: !Ref PrimaryALBDnsName
+        Port: 443
+        Type: HTTPS
+        ResourcePath: /health
+        RequestInterval: 10          # Fast check interval (costs more)
+        FailureThreshold: 2          # Fail after 2 consecutive failures
+        EnableSNI: true
+      HealthCheckTags:
+        - Key: Name
+          Value: primary-region-health
+
+  # Primary failover record
+  PrimaryDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      SetIdentifier: primary
+      Failover: PRIMARY
+      HealthCheckId: !Ref PrimaryHealthCheck
+      AliasTarget:
+        DNSName: !Ref PrimaryALBDnsName
+        HostedZoneId: !Ref PrimaryALBHostedZoneId
+        EvaluateTargetHealth: true   # Double-check: both R53 HC and ALB health
+
+  # Secondary failover record (no health check needed – it's the last resort)
+  SecondaryDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      SetIdentifier: secondary
+      Failover: SECONDARY
+      AliasTarget:
+        DNSName: !Ref SecondaryALBDnsName
+        HostedZoneId: !Ref SecondaryALBHostedZoneId
+        EvaluateTargetHealth: true
+
+  # =========================================================================
+  # SNS Topic for DR Alerts
+  # =========================================================================
+  DRAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: dr-alerts
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Purpose
+          Value: disaster-recovery-alerts
+
+  DRAlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref DRAlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # =========================================================================
+  # CloudWatch Alarms for DR Monitoring
+  #
+  # EXAM TIP: Monitor replication lag and health check status to detect
+  # degradation BEFORE a full outage.  Composite alarms combine multiple
+  # signals to reduce alert fatigue.
+  # =========================================================================
+  AuroraReplicationLagAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: aurora-global-replication-lag-high
+      AlarmDescription: >
+        Aurora Global Database replication lag exceeds 1000ms.
+        If sustained, RPO target is at risk.  Investigate network
+        throughput and cluster write volume.
+      MetricName: AuroraGlobalDBReplicationLag
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref DRAlertTopic
+      OKActions:
+        - !Ref DRAlertTopic
+
+  HealthCheckFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: primary-healthcheck-failed
+      AlarmDescription: >
+        Route 53 health check for primary region has failed.
+        DNS failover to secondary region may have been triggered.
+        Verify application status in both regions immediately.
+      MetricName: HealthCheckStatus
+      Namespace: AWS/Route53
+      Dimensions:
+        - Name: HealthCheckId
+          Value: !Ref PrimaryHealthCheck
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref DRAlertTopic
+
+  S3ReplicationLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: s3-replication-latency-high
+      AlarmDescription: >
+        S3 replication latency exceeds 15 minutes (RTC SLA threshold).
+        This may indicate large object backlog or network issues.
+      MetricName: ReplicationLatency
+      Namespace: AWS/S3
+      Dimensions:
+        - Name: SourceBucket
+          Value: !Ref PrimaryBucket
+        - Name: DestinationBucket
+          Value: !Ref SecondaryBucket
+        - Name: RuleId
+          Value: FullBucketReplication
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 900    # 15 minutes in seconds
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref DRAlertTopic
+
+  # Composite Alarm: fires when MULTIPLE DR indicators fail simultaneously
+  DRCompositeAlarm:
+    Type: AWS::CloudWatch::CompositeAlarm
+    Properties:
+      AlarmName: dr-composite-critical
+      AlarmDescription: >
+        CRITICAL: Multiple DR health indicators are failing simultaneously.
+        This likely indicates a regional outage.  Initiate failover runbook.
+      AlarmRule: !Sub >
+        ALARM("${AuroraReplicationLagAlarm}")
+        AND ALARM("${HealthCheckFailedAlarm}")
+      AlarmActions:
+        - !Ref DRAlertTopic
+      ActionsEnabled: true
+
+  # =========================================================================
+  # Lambda Function for Automated Failover
+  #
+  # EXAM TIP: Automated failover reduces RTO but must be carefully guarded
+  # against false positives.  The composite alarm above ensures multiple
+  # signals confirm a real outage before triggering.  The Lambda function
+  # handles Aurora Global DB failover and sends detailed notifications.
+  # =========================================================================
+  FailoverFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: dr-failover-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DRFailoverPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:FailoverGlobalCluster
+                  - rds:DescribeGlobalClusters
+                  - rds:DescribeDBClusters
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - route53:ChangeResourceRecordSets
+                  - route53:GetHostedZone
+                  - route53:ListResourceRecordSets
+                Resource: !Sub "arn:aws:route53:::hostedzone/${HostedZoneId}"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref DRAlertTopic
+
+  FailoverFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: dr-automated-failover
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 256
+      Role: !GetAtt FailoverFunctionRole.Arn
+      Environment:
+        Variables:
+          GLOBAL_CLUSTER_ID: dr-demo-global-cluster
+          SECONDARY_REGION: !Ref SecondaryRegion
+          SNS_TOPIC_ARN: !Ref DRAlertTopic
+          HOSTED_ZONE_ID: !Ref HostedZoneId
+          DOMAIN_NAME: !Ref DomainName
+      Code:
+        ZipFile: |
+          """
+          DR Automated Failover Lambda
+          
+          Triggered by CloudWatch composite alarm via SNS.
+          Performs Aurora Global Database managed failover and
+          sends detailed status notifications.
+          """
+          import json
+          import os
+          import time
+          import boto3
+          from botocore.exceptions import ClientError
+
+          rds = boto3.client("rds")
+          sns = boto3.client("sns")
+
+          GLOBAL_CLUSTER_ID = os.environ["GLOBAL_CLUSTER_ID"]
+          SECONDARY_REGION = os.environ["SECONDARY_REGION"]
+          SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
+
+          def handler(event, context):
+              print(f"Failover triggered by event: {json.dumps(event)}")
+              
+              try:
+                  global_cluster = rds.describe_global_clusters(
+                      GlobalClusterIdentifier=GLOBAL_CLUSTER_ID
+                  )["GlobalClusters"][0]
+                  
+                  secondary_arn = None
+                  for member in global_cluster["GlobalClusterMembers"]:
+                      if not member["IsWriter"]:
+                          secondary_arn = member["DBClusterArn"]
+                          break
+                  
+                  if not secondary_arn:
+                      raise ValueError("No secondary cluster found for failover")
+                  
+                  notify(f"INITIATING failover of {GLOBAL_CLUSTER_ID} "
+                         f"to secondary cluster: {secondary_arn}")
+                  
+                  # Managed planned failover: zero data loss, switches writer role
+                  rds.failover_global_cluster(
+                      GlobalClusterIdentifier=GLOBAL_CLUSTER_ID,
+                      TargetDbClusterIdentifier=secondary_arn
+                  )
+                  
+                  # Poll until failover completes (up to 5 minutes)
+                  for attempt in range(30):
+                      time.sleep(10)
+                      status = rds.describe_global_clusters(
+                          GlobalClusterIdentifier=GLOBAL_CLUSTER_ID
+                      )["GlobalClusters"][0]
+                      
+                      if status["Status"] == "available":
+                          notify(f"SUCCESS: Failover complete. "
+                                 f"New writer: {secondary_arn}")
+                          return {"statusCode": 200, "body": "Failover complete"}
+                  
+                  notify(f"WARNING: Failover initiated but not yet confirmed "
+                         f"after 5 minutes. Manual verification required.")
+                  
+              except ClientError as e:
+                  error_msg = f"FAILOVER ERROR: {str(e)}"
+                  print(error_msg)
+                  notify(error_msg)
+                  raise
+
+          def notify(message):
+              """Send SNS notification with DR event details."""
+              sns.publish(
+                  TopicArn=SNS_TOPIC_ARN,
+                  Subject="DR Failover Event",
+                  Message=message
+              )
+              print(f"Notification sent: {message}")
+
+  # SNS triggers the failover Lambda when composite alarm fires
+  FailoverSNSPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FailoverFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref DRAlertTopic
+
+  FailoverSNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref DRAlertTopic
+      Protocol: lambda
+      Endpoint: !GetAtt FailoverFunction.Arn
+      FilterPolicy:
+        # Only trigger Lambda for the composite alarm, not individual alarms
+        AlarmName:
+          - dr-composite-critical
+
+Outputs:
+  AuroraGlobalClusterId:
+    Description: Aurora Global Cluster identifier
+    Value: !Ref AuroraGlobalCluster
+
+  AuroraPrimaryEndpoint:
+    Description: Aurora primary cluster writer endpoint
+    Value: !GetAtt AuroraPrimaryCluster.Endpoint.Address
+
+  DRAlertTopicArn:
+    Description: SNS topic for DR alerts
+    Value: !Ref DRAlertTopic
+
+  PrimaryBucketName:
+    Description: Primary S3 bucket with CRR enabled
+    Value: !Ref PrimaryBucket
+
+  FailoverFunctionArn:
+    Description: Automated failover Lambda function ARN
+    Value: !GetAtt FailoverFunction.Arn

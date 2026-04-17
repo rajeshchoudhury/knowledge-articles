@@ -1,0 +1,777 @@
+################################################################################
+# AWS Solutions Architect Professional – Security Baseline (StackSet-Ready)
+#
+# KEY EXAM TOPICS DEMONSTRATED:
+#   • CloudTrail with organization-level logging (all regions, all accounts)
+#   • AWS Config rules for compliance (CIS Benchmark alignment)
+#   • Config auto-remediation with SSM Automation
+#   • GuardDuty for threat detection
+#   • Security Hub for aggregated security posture
+#   • S3 hardened bucket (encryption, versioning, Object Lock, public block)
+#   • KMS CMK with automatic rotation
+#   • IAM password policy enforcement
+#   • SNS alerting for security findings
+#
+# DEPLOYMENT STRATEGY:
+#   Deploy as a CloudFormation StackSet from the management account to all
+#   member accounts in the organization.  StackSets use service-managed
+#   permissions (AWS Organizations integration) for automatic deployment
+#   to new accounts.
+#
+# EXAM TIP: Security baseline must be deployed to ALL regions in ALL
+# accounts.  Use StackSets with "all regions" deployment to prevent
+# attackers from operating in unmonitored regions.
+################################################################################
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Organization-wide security baseline: CloudTrail, Config, GuardDuty,
+  Security Hub, hardened S3, KMS, IAM password policy, and alerting.
+
+Parameters:
+  OrganizationId:
+    Type: String
+    Description: AWS Organization ID (e.g., o-abc123xyz)
+
+  CentralSecurityAccountId:
+    Type: String
+    Description: Account ID of the central security/audit account for log aggregation.
+
+  CentralLoggingBucket:
+    Type: String
+    Description: S3 bucket in the security account for centralized CloudTrail logs.
+
+  AlertEmail:
+    Type: String
+    Description: Security team email for alerts.
+
+  EnableGuardDuty:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Whether to enable GuardDuty (may already be enabled by delegated admin).
+
+Conditions:
+  ShouldEnableGuardDuty: !Equals [!Ref EnableGuardDuty, "true"]
+
+Resources:
+  # =========================================================================
+  # CloudTrail – Organization-Level Logging
+  #
+  # EXAM TIP: CloudTrail records API calls (management events by default).
+  # Enable data events for S3 and Lambda if you need object-level and
+  # invocation-level logging.  Organization trails automatically cover
+  # all member accounts without per-account setup.
+  #
+  # Best practice: log to a CENTRAL bucket in the security account with
+  # an SCP preventing member accounts from deleting or modifying the trail.
+  # =========================================================================
+  TrailKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Encryption key for CloudTrail logs
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowRootAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowCloudTrailEncrypt
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+            Condition:
+              StringLike:
+                kms:EncryptionContext:aws:cloudtrail:arn:
+                  - !Sub "arn:aws:cloudtrail:*:${AWS::AccountId}:trail/*"
+          - Sid: AllowCloudTrailDecrypt
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: kms:Decrypt
+            Resource: "*"
+            Condition:
+              "Null":
+                kms:EncryptionContext:aws:cloudtrail:arn: "false"
+          - Sid: AllowSecurityAccountDecrypt
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${CentralSecurityAccountId}:root"
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+            Resource: "*"
+
+  # Local CloudTrail (in addition to org trail in management account)
+  CloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      TrailName: security-baseline-trail
+      IsLogging: true
+      IsMultiRegionTrail: true    # Monitor ALL regions
+      EnableLogFileValidation: true  # Tamper-proof log integrity
+      IncludeGlobalServiceEvents: true  # IAM, STS, CloudFront events
+      S3BucketName: !Ref CentralLoggingBucket
+      KMSKeyId: !GetAtt TrailKMSKey.Arn
+      CloudWatchLogsLogGroupArn: !GetAtt CloudTrailLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailCWRole.Arn
+      EventSelectors:
+        # Management events (API calls) – already default, but explicit
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+        # S3 data events – log object-level access for sensitive buckets
+        - ReadWriteType: All
+          DataResources:
+            - Type: AWS::S3::Object
+              Values:
+                - !Sub "arn:aws:s3:::${SecurityAuditBucket}/"
+      InsightSelectors:
+        - InsightType: ApiCallRateInsight    # Detect unusual API activity
+        - InsightType: ApiErrorRateInsight   # Detect unusual error spikes
+
+  CloudTrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/cloudtrail/security-baseline
+      RetentionInDays: 365
+      KmsKeyId: !GetAtt TrailKMSKey.Arn
+
+  CloudTrailCWRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudTrailToCloudWatch
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt CloudTrailLogGroup.Arn
+
+  # =========================================================================
+  # CloudTrail Metric Filters & Alarms – CIS Benchmark alignment
+  #
+  # EXAM TIP: CIS AWS Foundations Benchmark recommends metric filters for
+  # unauthorized API calls, console sign-in failures, root account usage,
+  # IAM policy changes, CloudTrail config changes, and more.
+  # =========================================================================
+  UnauthorizedAPICallsFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CloudTrailLogGroup
+      FilterPattern: '{ ($.errorCode = "*UnauthorizedAccess*") || ($.errorCode = "AccessDenied*") }'
+      MetricTransformations:
+        - MetricNamespace: SecurityBaseline
+          MetricName: UnauthorizedAPICalls
+          MetricValue: "1"
+          DefaultValue: 0
+
+  UnauthorizedAPICallsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: CIS-UnauthorizedAPICalls
+      AlarmDescription: >
+        CIS 3.1 – Unauthorized API calls detected.
+        Investigate CloudTrail logs for the source identity.
+      MetricName: UnauthorizedAPICalls
+      Namespace: SecurityBaseline
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref SecurityAlertTopic
+
+  RootAccountUsageFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CloudTrailLogGroup
+      FilterPattern: >
+        { $.userIdentity.type = "Root" && $.userIdentity.invokedBy NOT EXISTS
+        && $.eventType != "AwsServiceEvent" }
+      MetricTransformations:
+        - MetricNamespace: SecurityBaseline
+          MetricName: RootAccountUsage
+          MetricValue: "1"
+          DefaultValue: 0
+
+  RootAccountUsageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: CIS-RootAccountUsage
+      AlarmDescription: >
+        CIS 1.7 – Root account was used.  Root should only be used for
+        tasks that specifically require root (e.g., enabling MFA on root,
+        changing account settings).
+      MetricName: RootAccountUsage
+      Namespace: SecurityBaseline
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref SecurityAlertTopic
+
+  IAMPolicyChangesFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CloudTrailLogGroup
+      FilterPattern: >
+        { ($.eventName=DeleteGroupPolicy) || ($.eventName=DeleteRolePolicy) ||
+        ($.eventName=DeleteUserPolicy) || ($.eventName=PutGroupPolicy) ||
+        ($.eventName=PutRolePolicy) || ($.eventName=PutUserPolicy) ||
+        ($.eventName=CreatePolicy) || ($.eventName=DeletePolicy) ||
+        ($.eventName=AttachRolePolicy) || ($.eventName=DetachRolePolicy) ||
+        ($.eventName=AttachUserPolicy) || ($.eventName=DetachUserPolicy) ||
+        ($.eventName=AttachGroupPolicy) || ($.eventName=DetachGroupPolicy) }
+      MetricTransformations:
+        - MetricNamespace: SecurityBaseline
+          MetricName: IAMPolicyChanges
+          MetricValue: "1"
+          DefaultValue: 0
+
+  IAMPolicyChangesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: CIS-IAMPolicyChanges
+      AlarmDescription: >
+        CIS 3.4 – IAM policy changes detected.
+        Review the change for least-privilege compliance.
+      MetricName: IAMPolicyChanges
+      Namespace: SecurityBaseline
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref SecurityAlertTopic
+
+  # =========================================================================
+  # AWS Config Rules
+  #
+  # EXAM TIP: Config evaluates resource configurations against rules
+  # continuously.  Managed rules are pre-built by AWS; custom rules use
+  # Lambda.  Config must be enabled in EVERY region for full coverage.
+  # =========================================================================
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      Name: default
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true  # IAM resources (global)
+      RoleARN: !GetAtt ConfigRole.Arn
+
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Properties:
+      S3BucketName: !Ref CentralLoggingBucket
+      S3KeyPrefix: config
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: Six_Hours
+
+  ConfigRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWS_ConfigRole
+      Policies:
+        - PolicyName: ConfigS3Delivery
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${CentralLoggingBucket}/config/*"
+                Condition:
+                  StringEquals:
+                    s3:x-amz-acl: bucket-owner-full-control
+
+  # Rule 1: EBS volumes must be encrypted
+  EncryptedVolumesRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: encrypted-volumes
+      Description: Ensures all EBS volumes are encrypted
+      Source:
+        Owner: AWS
+        SourceIdentifier: ENCRYPTED_VOLUMES
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::Volume
+
+  # Rule 2: S3 buckets must not be publicly accessible
+  S3PublicReadRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: s3-bucket-public-read-prohibited
+      Description: Ensures S3 buckets do not allow public read access
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_PUBLIC_READ_PROHIBITED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::S3::Bucket
+
+  S3PublicWriteRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: s3-bucket-public-write-prohibited
+      Description: Ensures S3 buckets do not allow public write access
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_PUBLIC_WRITE_PROHIBITED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::S3::Bucket
+
+  # Rule 3: Root account must have MFA enabled
+  RootMFARule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: root-account-mfa-enabled
+      Description: Ensures MFA is enabled on the root account
+      Source:
+        Owner: AWS
+        SourceIdentifier: ROOT_ACCOUNT_MFA_ENABLED
+      MaximumExecutionFrequency: TwelveHours
+
+  # Rule 4: No unrestricted SSH (port 22 open to 0.0.0.0/0)
+  RestrictedSSHRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: restricted-ssh
+      Description: Ensures no security group allows unrestricted SSH access
+      Source:
+        Owner: AWS
+        SourceIdentifier: INCOMING_SSH_DISABLED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::SecurityGroup
+
+  # Rule 5: S3 bucket encryption enabled
+  S3EncryptionRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: s3-bucket-server-side-encryption-enabled
+      Description: Ensures S3 buckets have default encryption enabled
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_SERVER_SIDE_ENCRYPTION_ENABLED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::S3::Bucket
+
+  # Rule 6: RDS instances must be encrypted
+  RDSEncryptionRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: rds-storage-encrypted
+      Description: Ensures RDS instances have storage encryption enabled
+      Source:
+        Owner: AWS
+        SourceIdentifier: RDS_STORAGE_ENCRYPTED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::RDS::DBInstance
+
+  # =========================================================================
+  # Config Auto-Remediation
+  #
+  # EXAM TIP: Config remediation can automatically fix non-compliant
+  # resources using SSM Automation documents.  Use automatic remediation
+  # for clear-cut violations (e.g., enable S3 encryption).  Use manual
+  # remediation for changes that need review (e.g., terminating instances).
+  # =========================================================================
+  S3EncryptionRemediation:
+    Type: AWS::Config::RemediationConfiguration
+    Properties:
+      ConfigRuleName: !Ref S3EncryptionRule
+      TargetType: SSM_DOCUMENT
+      TargetId: AWS-EnableS3BucketEncryption
+      Automatic: true
+      MaximumAutomaticAttempts: 3
+      RetryAttemptSeconds: 60
+      Parameters:
+        BucketName:
+          ResourceValue:
+            Value: RESOURCE_ID
+        SSEAlgorithm:
+          StaticValue:
+            Values:
+              - AES256
+        AutomationAssumeRole:
+          StaticValue:
+            Values:
+              - !GetAtt RemediationRole.Arn
+
+  # Remediation: remove public access from S3 buckets
+  S3PublicAccessRemediation:
+    Type: AWS::Config::RemediationConfiguration
+    Properties:
+      ConfigRuleName: !Ref S3PublicReadRule
+      TargetType: SSM_DOCUMENT
+      TargetId: AWS-DisableS3BucketPublicReadWrite
+      Automatic: true
+      MaximumAutomaticAttempts: 3
+      RetryAttemptSeconds: 60
+      Parameters:
+        S3BucketName:
+          ResourceValue:
+            Value: RESOURCE_ID
+        AutomationAssumeRole:
+          StaticValue:
+            Values:
+              - !GetAtt RemediationRole.Arn
+
+  RemediationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: config-remediation-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RemediationActions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutEncryptionConfiguration
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:GetBucketPublicAccessBlock
+                  - s3:PutBucketAcl
+                  - s3:GetBucketAcl
+                Resource: "*"
+
+  # =========================================================================
+  # GuardDuty – Threat Detection
+  #
+  # EXAM TIP: GuardDuty uses ML, anomaly detection, and threat intelligence
+  # to detect threats.  It analyzes VPC Flow Logs, CloudTrail logs, and DNS
+  # logs WITHOUT requiring you to enable them.  Enable in ALL regions.
+  # Use delegated administrator in Organizations for central management.
+  # =========================================================================
+  GuardDutyDetector:
+    Type: AWS::GuardDuty::Detector
+    Condition: ShouldEnableGuardDuty
+    Properties:
+      Enable: true
+      FindingPublishingFrequency: FIFTEEN_MINUTES
+      DataSources:
+        S3Logs:
+          Enable: true
+        Kubernetes:
+          AuditLogs:
+            Enable: true
+        MalwareProtection:
+          ScanEc2InstanceWithFindings:
+            EbsVolumes: true
+
+  # =========================================================================
+  # Security Hub – Aggregated Security Posture
+  #
+  # EXAM TIP: Security Hub aggregates findings from GuardDuty, Inspector,
+  # Macie, Config, Firewall Manager, and third-party tools into a single
+  # pane.  Enable CIS and AWS Foundational Security Best Practices standards.
+  # Cross-region aggregation sends all findings to one region.
+  # =========================================================================
+  SecurityHub:
+    Type: AWS::SecurityHub::Hub
+    Properties:
+      Tags:
+        Environment: security-baseline
+
+  # =========================================================================
+  # Hardened S3 Bucket – Security Audit Logs
+  #
+  # EXAM TIP: Defense-in-depth for S3:
+  #   1. Block all public access (account + bucket level)
+  #   2. Default encryption (SSE-KMS)
+  #   3. Versioning (protect against accidental deletes)
+  #   4. Object Lock (WORM – prevents even root from deleting)
+  #   5. Lifecycle rules (transition to cheaper storage over time)
+  #   6. Bucket policy restricting access to specific accounts/roles
+  # =========================================================================
+  SecurityAuditBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "security-audit-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention:
+            Mode: GOVERNANCE          # GOVERNANCE allows override with permission;
+            Days: 365                 # COMPLIANCE mode is truly immutable
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref SecurityKMSKey
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+              - StorageClass: DEEP_ARCHIVE
+                TransitionInDays: 365
+      LoggingConfiguration:
+        DestinationBucketName: !Sub "security-audit-${AWS::AccountId}-${AWS::Region}"
+        LogFilePrefix: access-logs/
+
+  SecurityAuditBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SecurityAuditBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Enforce HTTPS only
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt SecurityAuditBucket.Arn
+              - !Sub "${SecurityAuditBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+          # Allow central security account read access
+          - Sid: AllowSecurityAccountRead
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${CentralSecurityAccountId}:root"
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt SecurityAuditBucket.Arn
+              - !Sub "${SecurityAuditBucket.Arn}/*"
+
+  # =========================================================================
+  # KMS Key with Automatic Rotation
+  # =========================================================================
+  SecurityKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Security baseline encryption key
+      EnableKeyRotation: true     # Automatic annual key material rotation
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowRootAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: "*"
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn:
+                  !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+
+  SecurityKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/security-baseline
+      TargetKeyId: !Ref SecurityKMSKey
+
+  # =========================================================================
+  # IAM Password Policy
+  #
+  # EXAM TIP: CIS Benchmark requires:
+  #   - Minimum 14 characters
+  #   - Require uppercase, lowercase, numbers, symbols
+  #   - Prevent password reuse (last 24)
+  #   - Max password age 90 days
+  # This only affects IAM console users (not programmatic access).
+  # =========================================================================
+  IAMPasswordPolicy:
+    Type: AWS::IAM::AccountPasswordPolicy
+    Properties:
+      MinimumPasswordLength: 14
+      RequireUppercaseCharacters: true
+      RequireLowercaseCharacters: true
+      RequireNumbers: true
+      RequireSymbols: true
+      MaxPasswordAge: 90
+      PasswordReusePrevention: 24
+      AllowUsersToChangePassword: true
+      HardExpiry: false
+
+  # =========================================================================
+  # SNS Alerts for Security Findings
+  # =========================================================================
+  SecurityAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: security-alerts
+      KmsMasterKeyId: alias/aws/sns
+
+  SecurityAlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SecurityAlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # EventBridge rule to capture GuardDuty HIGH/CRITICAL findings
+  GuardDutyFindingsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: guardduty-high-severity
+      Description: Route high-severity GuardDuty findings to SNS
+      EventPattern:
+        source:
+          - aws.guardduty
+        detail-type:
+          - "GuardDuty Finding"
+        detail:
+          severity:
+            - numeric: [">=", 7]     # HIGH and CRITICAL severity
+      Targets:
+        - Id: SecurityAlerts
+          Arn: !Ref SecurityAlertTopic
+
+  # Allow EventBridge to publish to SNS
+  SecurityAlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref SecurityAlertTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref SecurityAlertTopic
+
+  # EventBridge rule: Security Hub critical findings
+  SecurityHubFindingsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: securityhub-critical-findings
+      Description: Route critical Security Hub findings to SNS
+      EventPattern:
+        source:
+          - aws.securityhub
+        detail-type:
+          - "Security Hub Findings - Imported"
+        detail:
+          findings:
+            Severity:
+              Label:
+                - CRITICAL
+                - HIGH
+      Targets:
+        - Id: SecurityAlerts
+          Arn: !Ref SecurityAlertTopic
+
+  # EventBridge rule: Config compliance changes
+  ConfigComplianceRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: config-compliance-change
+      Description: Alert when resources become non-compliant
+      EventPattern:
+        source:
+          - aws.config
+        detail-type:
+          - "Config Rules Compliance Change"
+        detail:
+          messageType:
+            - ComplianceChangeNotification
+          newEvaluationResult:
+            complianceType:
+              - NON_COMPLIANT
+      Targets:
+        - Id: SecurityAlerts
+          Arn: !Ref SecurityAlertTopic
+
+Outputs:
+  CloudTrailArn:
+    Description: CloudTrail ARN
+    Value: !GetAtt CloudTrail.Arn
+
+  SecurityAuditBucketName:
+    Description: Security audit S3 bucket
+    Value: !Ref SecurityAuditBucket
+
+  SecurityKMSKeyArn:
+    Description: Security KMS key ARN
+    Value: !GetAtt SecurityKMSKey.Arn
+
+  SecurityAlertTopicArn:
+    Description: Security alerts SNS topic
+    Value: !Ref SecurityAlertTopic
+
+  GuardDutyDetectorId:
+    Description: GuardDuty detector ID
+    Condition: ShouldEnableGuardDuty
+    Value: !Ref GuardDutyDetector
