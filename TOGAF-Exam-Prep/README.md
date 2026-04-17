@@ -174,21 +174,47 @@ You can take Part 1 and Part 2 as a single combined sitting. The combined exam r
 | Practice Test 19 | Certified — Full Exam Simulation #1 | 8 |
 | Practice Test 20 | Certified — Full Exam Simulation #2 | 8 |
 | Practice Test 21 | Certified — Full Exam Simulation #3 | 8 |
-| Practice Test 22 | Combined — Foundation Full Simulation | 40 |
-| Practice Test 23 | Combined — Certified Full Simulation | 8 |
-| Practice Test 24 | Combined — Foundation Full Simulation | 40 |
-| Practice Test 25 | Combined — Certified Full Simulation | 8 |
+| Practice Test 22 | Certified — Scenario Full Simulation (Telco) | 8 |
+| Practice Test 23 | Foundation Final — The Deep Dive | 40 |
+| Practice Test 24 | Foundation Final — The Comparison Test | 40 |
+| Practice Test 25 | Foundation Final — The Ultimate Test | 40 |
+| **— EXPANSION SET: Very Hard Tests —** | | |
+| Practice Test 26 | **HARD** Foundation — ADM Phase Mastery | 40 |
+| Practice Test 27 | **HARD** Foundation — Content Framework Expert | 40 |
+| Practice Test 28 | **HARD** Foundation — Governance & Compliance Deep Dive | 40 |
+| Practice Test 29 | **HARD** Foundation — Confusing Concepts Disambiguator | 40 |
+| Practice Test 30 | **HARD** Foundation — Integration & Cross-Cutting | 40 |
+| Practice Test 31 | **HARD** Foundation — Reference Models & Continuum Expert | 40 |
+| Practice Test 32 | **HARD** Foundation — Guidelines & Techniques Specialist | 40 |
+| Practice Test 33 | **HARD** Foundation — Architecture Repository & Landscape | 40 |
+| Practice Test 34 | **HARD** Foundation — Stakeholders, Views, Security | 40 |
+| Practice Test 35 | **HARD** Foundation — The Ultimate Killer Test | 40 |
+| Practice Test 36 | **HARD** Certified — Complex Enterprise Scenarios I | 8 |
+| Practice Test 37 | **HARD** Certified — Complex Enterprise Scenarios II | 8 |
+| Practice Test 38 | **HARD** Certified — Architectural Conflict Resolution | 8 |
+| Practice Test 39 | **HARD** Certified — Crisis & Change Scenarios | 8 |
+| Practice Test 40 | **HARD** Certified — Strategic Decision Scenarios | 8 |
+| Practice Test 41 | **EXPERT** Foundation — The Impossible Test (exact definitions) | 40 |
+| Practice Test 42 | **EXPERT** Foundation — The Relationships Test | 40 |
+| Practice Test 43 | **EXPERT** Certified — Real-World Expert Scenarios | 8 |
+| Practice Test 44 | **EXPERT** Certified — The Governance Gauntlet | 8 |
+| Practice Test 45 | **EXPERT** Mixed Format — The Final Boss (20 MC + 4 scenarios) | 24 |
+
+**Total: 45 practice tests | 1,400+ unique questions**
 
 ### Flashcard Decks
 
-| Deck | Cards | Topic |
-|---|---|---|
-| Deck A | 80+ | Key TOGAF Terminology and Definitions |
-| Deck B | 60+ | ADM Phases — Inputs, Steps, Outputs |
-| Deck C | 50+ | Content Framework — Deliverables, Artifacts, Building Blocks |
-| Deck D | 40+ | Governance, Compliance, and Capability Framework |
-| Deck E | 30+ | Reference Models and Enterprise Continuum |
-| Deck F | 40+ | ADM Guidelines and Techniques |
+| Deck | File | Cards | Topic |
+|---|---|---|---|
+| Deck 01 | `01-Core-Concepts-Flashcards.md` | 50+ | Key TOGAF Terminology and Definitions |
+| Deck 02 | `02-ADM-Phases-Flashcards.md` | 100+ | ADM Phases — Inputs, Steps, Outputs |
+| Deck 03 | `03-Guidelines-Techniques-Flashcards.md` | 50+ | ADM Guidelines and Techniques |
+| Deck 04 | `04-Content-Framework-Flashcards.md` | 50+ | Deliverables, Artifacts, Building Blocks |
+| Deck 05 | `05-Governance-Capability-Flashcards.md` | 50+ | Governance, Compliance, Capability |
+| Deck 06 | `06-Advanced-Tricky-Flashcards.md` | 30 | **Advanced & Tricky Concepts** (commonly confused) |
+| Deck 07 | `07-Exam-Trap-Flashcards.md` | 25 | **Exam Traps** (common misconceptions with truth) |
+
+**Total: 355+ flashcards**
 
 ### Reference Diagrams
 
